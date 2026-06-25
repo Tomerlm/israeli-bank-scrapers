@@ -311,17 +311,19 @@ async function getCurrentBalance(page: Page | Frame): Promise<number> {
   return getAmountData(balanceStr);
 }
 
-// TODO: Verify these selectors against the live fibi.co.il OTP page before deploying.
-// Run a headed Puppeteer session and inspect the DOM when the bank requests an SMS code.
-const OTP_CONTAINER_SELECTOR = '.otp-container, #otp-container, form.otp-form';
-const OTP_INPUT_SELECTOR = 'input[name="otpCode"], input[name="otp"], input#otpCode, input#otp';
-const OTP_SUBMIT_SELECTOR = 'button[type="submit"].otp-submit, #submitOtp, button#otpSubmit';
+// Selectors verified against live fibi.co.il OTP page.
+const OTP_SEND_SMS_SELECTOR = '#sendSms';
+const OTP_INPUT_SELECTOR = '#codeinput';
+const OTP_SUBMIT_SELECTOR = '.otpSubmitButton';
 
 async function handleOtpChallenge(page: Page, otpCodeRetriever: () => Promise<string>): Promise<void> {
+  // Click "שלח" to trigger the SMS to the user's registered phone
+  await clickButton(page, OTP_SEND_SMS_SELECTOR);
+  // Suspend until the caller provides the code (user reads SMS and submits via UI)
   const otpCode = await otpCodeRetriever();
   await fillInput(page, OTP_INPUT_SELECTOR, otpCode);
   await clickButton(page, OTP_SUBMIT_SELECTOR);
-  // Wait for success page after OTP submission
+  // Wait for the post-login dashboard to appear after successful OTP
   await Promise.race([
     waitUntilElementFound(page, '#card-header', false),
     waitUntilElementFound(page, '#account_num', true),
@@ -332,9 +334,10 @@ async function handleOtpChallenge(page: Page, otpCodeRetriever: () => Promise<st
 
 export async function waitForPostLogin(page: Page, otpCodeRetriever?: () => Promise<string>) {
   if (otpCodeRetriever) {
-    // Race the OTP challenge page against the success page selectors
+    // Race the OTP challenge page against the success page selectors.
+    // Accounts that don't trigger 2FA will reach the dashboard directly.
     await Promise.race([
-      waitUntilElementFound(page, OTP_CONTAINER_SELECTOR, true).then(() =>
+      waitUntilElementFound(page, OTP_SEND_SMS_SELECTOR, true).then(() =>
         handleOtpChallenge(page, otpCodeRetriever),
       ),
       waitUntilElementFound(page, '#card-header', false),
