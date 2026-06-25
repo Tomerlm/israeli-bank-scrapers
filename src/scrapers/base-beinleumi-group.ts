@@ -299,15 +299,18 @@ async function getAccountTransactions(page: Page | Frame, options?: ScraperOptio
   return txns;
 }
 
-async function getCurrentBalance(page: Page | Frame): Promise<number> {
-  // Wait for the balance element to appear and be visible
-  await waitUntilElementFound(page, CURRENT_BALANCE, true, ELEMENT_RENDER_TIMEOUT_MS);
+async function getCurrentBalance(page: Page | Frame): Promise<number | undefined> {
+  // Use a short non-throwing poll: if .main_balance doesn't appear in the
+  // timeout window (bank may have changed their UI), return undefined gracefully
+  // so the rest of the scrape (transactions) can still proceed.
+  const balanceElement = await page
+    .waitForSelector(CURRENT_BALANCE, { visible: true, timeout: ELEMENT_RENDER_TIMEOUT_MS })
+    .catch(() => null);
+  if (!balanceElement) {
+    return undefined;
+  }
 
-  // Extract text content
-  const balanceStr = await page.$eval(CURRENT_BALANCE, el => {
-    return (el as HTMLElement).innerText;
-  });
-
+  const balanceStr = await balanceElement.evaluate(el => (el as HTMLElement).innerText);
   return getAmountData(balanceStr);
 }
 
@@ -337,15 +340,16 @@ async function handleOtpChallenge(page: Page, otpCodeRetriever: () => Promise<st
 export async function waitForPostLogin(page: Page, otpCodeRetriever?: () => Promise<string>) {
   if (otpCodeRetriever) {
     // Race the OTP challenge page against the success page selectors.
-    // Accounts that don't trigger 2FA will reach the dashboard directly.
+    // The dashboard-detection branches use a long timeout so they don't reject
+    // while the OTP retriever is paused waiting for the user to supply the code.
+    // (handleOtpChallenge has its own inner wait for dashboard elements after submit.)
+    const NO_OTP_TIMEOUT_MS = 180_000;
     await Promise.race([
-      waitUntilElementFound(page, OTP_SEND_SMS_SELECTOR, true).then(() =>
-        handleOtpChallenge(page, otpCodeRetriever),
-      ),
-      waitUntilElementFound(page, '#card-header', false),
-      waitUntilElementFound(page, '#account_num', true),
-      waitUntilElementFound(page, '#matafLogoutLink', true),
-      waitUntilElementFound(page, '#validationMsg', true),
+      waitUntilElementFound(page, OTP_SEND_SMS_SELECTOR, true).then(() => handleOtpChallenge(page, otpCodeRetriever)),
+      waitUntilElementFound(page, '#card-header', false, NO_OTP_TIMEOUT_MS),
+      waitUntilElementFound(page, '#account_num', true, NO_OTP_TIMEOUT_MS),
+      waitUntilElementFound(page, '#matafLogoutLink', true, NO_OTP_TIMEOUT_MS),
+      waitUntilElementFound(page, '#validationMsg', true, NO_OTP_TIMEOUT_MS),
     ]);
   } else {
     await Promise.race([
