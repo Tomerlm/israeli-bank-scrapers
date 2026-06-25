@@ -70,11 +70,11 @@ export const SCRAPERS = {
   },
   [CompanyTypes.beinleumi]: {
     name: 'Beinleumi',
-    loginFields: ['username', PASSWORD_FIELD],
+    loginFields: ['username', PASSWORD_FIELD, 'otpCodeRetriever'],
   },
   [CompanyTypes.massad]: {
     name: 'Massad',
-    loginFields: ['username', PASSWORD_FIELD],
+    loginFields: ['username', PASSWORD_FIELD, 'otpCodeRetriever'],
   },
   [CompanyTypes.yahav]: {
     name: 'Bank Yahav',
