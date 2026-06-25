@@ -319,6 +319,8 @@ const OTP_SUBMIT_SELECTOR = '.otpSubmitButton';
 async function handleOtpChallenge(page: Page, otpCodeRetriever: () => Promise<string>): Promise<void> {
   // Click "שלח" to trigger the SMS to the user's registered phone
   await clickButton(page, OTP_SEND_SMS_SELECTOR);
+  // Wait for the OTP input to animate into the DOM (fadeInDown animation)
+  await waitUntilElementFound(page, OTP_INPUT_SELECTOR, true);
   // Suspend until the caller provides the code (user reads SMS and submits via UI)
   const otpCode = await otpCodeRetriever();
   await fillInput(page, OTP_INPUT_SELECTOR, otpCode);
