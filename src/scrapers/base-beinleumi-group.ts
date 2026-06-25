@@ -311,13 +311,45 @@ async function getCurrentBalance(page: Page | Frame): Promise<number> {
   return getAmountData(balanceStr);
 }
 
-export async function waitForPostLogin(page: Page) {
-  return Promise.race([
-    waitUntilElementFound(page, '#card-header', false), // New UI
-    waitUntilElementFound(page, '#account_num', true), // New UI
-    waitUntilElementFound(page, '#matafLogoutLink', true), // Old UI
-    waitUntilElementFound(page, '#validationMsg', true), // Old UI
+// TODO: Verify these selectors against the live fibi.co.il OTP page before deploying.
+// Run a headed Puppeteer session and inspect the DOM when the bank requests an SMS code.
+const OTP_CONTAINER_SELECTOR = '.otp-container, #otp-container, form.otp-form';
+const OTP_INPUT_SELECTOR = 'input[name="otpCode"], input[name="otp"], input#otpCode, input#otp';
+const OTP_SUBMIT_SELECTOR = 'button[type="submit"].otp-submit, #submitOtp, button#otpSubmit';
+
+async function handleOtpChallenge(page: Page, otpCodeRetriever: () => Promise<string>): Promise<void> {
+  const otpCode = await otpCodeRetriever();
+  await fillInput(page, OTP_INPUT_SELECTOR, otpCode);
+  await clickButton(page, OTP_SUBMIT_SELECTOR);
+  // Wait for success page after OTP submission
+  await Promise.race([
+    waitUntilElementFound(page, '#card-header', false),
+    waitUntilElementFound(page, '#account_num', true),
+    waitUntilElementFound(page, '#matafLogoutLink', true),
+    waitUntilElementFound(page, '#validationMsg', true),
   ]);
+}
+
+export async function waitForPostLogin(page: Page, otpCodeRetriever?: () => Promise<string>) {
+  if (otpCodeRetriever) {
+    // Race the OTP challenge page against the success page selectors
+    await Promise.race([
+      waitUntilElementFound(page, OTP_CONTAINER_SELECTOR, true).then(() =>
+        handleOtpChallenge(page, otpCodeRetriever),
+      ),
+      waitUntilElementFound(page, '#card-header', false),
+      waitUntilElementFound(page, '#account_num', true),
+      waitUntilElementFound(page, '#matafLogoutLink', true),
+      waitUntilElementFound(page, '#validationMsg', true),
+    ]);
+  } else {
+    await Promise.race([
+      waitUntilElementFound(page, '#card-header', false), // New UI
+      waitUntilElementFound(page, '#account_num', true), // New UI
+      waitUntilElementFound(page, '#matafLogoutLink', true), // Old UI
+      waitUntilElementFound(page, '#validationMsg', true), // Old UI
+    ]);
+  }
 }
 
 async function fetchAccountData(page: Page | Frame, startDate: Moment, options?: ScraperOptions) {
@@ -500,7 +532,11 @@ async function fetchAccounts(page: Page, startDate: Moment, options?: ScraperOpt
   return accounts;
 }
 
-type ScraperSpecificCredentials = { username: string; password: string };
+type ScraperSpecificCredentials = {
+  username: string;
+  password: string;
+  otpCodeRetriever?: () => Promise<string>;
+};
 
 class BeinleumiGroupBaseScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> {
   BASE_URL = '';
@@ -514,7 +550,7 @@ class BeinleumiGroupBaseScraper extends BaseScraperWithBrowser<ScraperSpecificCr
       loginUrl: `${this.LOGIN_URL}`,
       fields: createLoginFields(credentials),
       submitButtonSelector: '#continueBtn',
-      postAction: async () => waitForPostLogin(this.page),
+      postAction: async () => waitForPostLogin(this.page, credentials.otpCodeRetriever),
       possibleResults: getPossibleLoginResults(),
       // HACK: For some reason, though the login button (#continueBtn) is present and visible, the click action does not perform.
       // Adding this delay fixes the issue.
