@@ -29,7 +29,7 @@ export abstract class BasePortfolioScraper implements PortfolioScraper {
       try {
         await browser.close();
       } catch {
-        // ignore close errors
+        // ignore close errors — the real error (if any) was already captured above
       }
     }
   }

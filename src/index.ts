@@ -26,5 +26,6 @@ export type {
   PortfolioPosition,
   PortfolioCash,
 } from './portfolio-scrapers/interface';
+export { BasePortfolioScraper } from './portfolio-scrapers/base-portfolio-scraper';
 export type { BasePortfolioScraperOptions } from './portfolio-scrapers/base-portfolio-scraper';
 export type { PortfolioScraperOptions } from './portfolio-scrapers/factory';

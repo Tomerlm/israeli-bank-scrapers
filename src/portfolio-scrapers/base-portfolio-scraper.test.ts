@@ -83,7 +83,7 @@ describe('BasePortfolioScraper', () => {
     expect(mockBrowser.close).toHaveBeenCalledTimes(1);
   });
 
-  test('passes args and timeout options to puppeteer', async () => {
+  test('launches puppeteer headless by default', async () => {
     const scraper = new SuccessStub({
       positions: [],
       cash: [],
