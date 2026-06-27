@@ -25,11 +25,8 @@ class SuccessStub extends BasePortfolioScraper {
     super({});
   }
 
-  protected async fetchPortfolio(
-    _page: Page,
-    _credentials: Record<string, unknown>,
-  ): Promise<FetchResult> {
-    return this.result;
+  protected fetchPortfolio(): Promise<FetchResult> {
+    return Promise.resolve(this.result);
   }
 }
 
@@ -38,11 +35,8 @@ class ThrowingStub extends BasePortfolioScraper {
     super({});
   }
 
-  protected async fetchPortfolio(
-    _page: Page,
-    _credentials: Record<string, unknown>,
-  ): Promise<FetchResult> {
-    throw new Error(this.message);
+  protected fetchPortfolio(): Promise<FetchResult> {
+    return Promise.reject(new Error(this.message));
   }
 }
 
@@ -91,8 +85,7 @@ describe('BasePortfolioScraper', () => {
     });
     await scraper.scrape({});
 
-    expect(puppeteer.launch).toHaveBeenCalledWith(
-      expect.objectContaining({ headless: true }),
-    );
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(puppeteer.launch).toHaveBeenCalledWith(expect.objectContaining({ headless: true }));
   });
 });
