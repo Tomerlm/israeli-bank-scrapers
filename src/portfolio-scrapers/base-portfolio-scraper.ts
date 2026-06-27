@@ -10,7 +10,7 @@ export type BasePortfolioScraperOptions = {
 export abstract class BasePortfolioScraper implements PortfolioScraper {
   constructor(protected options: BasePortfolioScraperOptions) {}
 
-  async scrape(credentials: Record<string, string>): Promise<PortfolioScrapingResult> {
+  async scrape(credentials: Record<string, unknown>): Promise<PortfolioScrapingResult> {
     const browser = await puppeteer.launch({
       headless: !this.options.showBrowser,
       args: this.options.args,
@@ -36,6 +36,6 @@ export abstract class BasePortfolioScraper implements PortfolioScraper {
 
   protected abstract fetchPortfolio(
     page: Page,
-    credentials: Record<string, string>,
+    credentials: Record<string, unknown>,
   ): Promise<{ positions: PortfolioPosition[]; cash: PortfolioCash[]; asOfDate: string }>;
 }
