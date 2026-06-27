@@ -1,3 +1,4 @@
+import { assertNever } from '../assertNever';
 import { PortfolioCompanyTypes } from '../portfolio-definitions';
 import { type BasePortfolioScraperOptions } from './base-portfolio-scraper';
 import type { PortfolioScraper } from './interface';
@@ -11,9 +12,7 @@ export function createPortfolioScraper(options: PortfolioScraperOptions): Portfo
   switch (options.companyId) {
     case PortfolioCompanyTypes.psagot:
       return new PsagotScraper(options);
-    default: {
-      const exhausted: never = options.companyId;
-      throw new Error(`Unknown portfolio company: ${exhausted}`);
-    }
+    default:
+      assertNever(options.companyId, `Unknown portfolio company: ${options.companyId}`);
   }
 }
