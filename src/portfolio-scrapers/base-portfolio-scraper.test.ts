@@ -27,7 +27,7 @@ class SuccessStub extends BasePortfolioScraper {
 
   protected async fetchPortfolio(
     _page: Page,
-    _credentials: Record<string, string>,
+    _credentials: Record<string, unknown>,
   ): Promise<FetchResult> {
     return this.result;
   }
@@ -40,7 +40,7 @@ class ThrowingStub extends BasePortfolioScraper {
 
   protected async fetchPortfolio(
     _page: Page,
-    _credentials: Record<string, string>,
+    _credentials: Record<string, unknown>,
   ): Promise<FetchResult> {
     throw new Error(this.message);
   }

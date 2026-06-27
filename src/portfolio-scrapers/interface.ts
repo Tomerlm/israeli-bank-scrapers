@@ -18,5 +18,5 @@ export type PortfolioScrapingResult =
   | { success: false; errorType: string; errorMessage: string };
 
 export interface PortfolioScraper {
-  scrape(credentials: Record<string, string>): Promise<PortfolioScrapingResult>;
+  scrape(credentials: Record<string, unknown>): Promise<PortfolioScrapingResult>;
 }
