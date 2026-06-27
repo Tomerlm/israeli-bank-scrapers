@@ -35,27 +35,23 @@ describe('PsagotScraper', () => {
   test('calls accessibility setup before filling credentials', async () => {
     const mockPage = makeMockPage();
     const scraper = new PsagotScraper({});
-    await (scraper as unknown as { fetchPortfolio: (p: Page, c: Record<string, unknown>) => Promise<unknown> })
-      .fetchPortfolio(mockPage as unknown as Page, { username: 'u', password: 'p' });
+    await (
+      scraper as unknown as { fetchPortfolio: (p: Page, c: Record<string, unknown>) => Promise<unknown> }
+    ).fetchPortfolio(mockPage as unknown as Page, { username: 'u', password: 'p' });
 
     // First evaluate call should enable Flutter accessibility
     expect(mockPage.evaluate).toHaveBeenCalled();
     // Should type into both username and password fields
-    expect(mockPage.type).toHaveBeenCalledWith(
-      expect.stringContaining('Username'),
-      'u',
-    );
-    expect(mockPage.type).toHaveBeenCalledWith(
-      expect.stringContaining('Password'),
-      'p',
-    );
+    expect(mockPage.type).toHaveBeenCalledWith(expect.stringContaining('Username'), 'u');
+    expect(mockPage.type).toHaveBeenCalledWith(expect.stringContaining('Password'), 'p');
   });
 
   test('returns result with asOfDate and empty positions/cash from placeholder impl', async () => {
     const mockPage = makeMockPage();
     const scraper = new PsagotScraper({});
-    const result = await (scraper as unknown as { fetchPortfolio: (p: Page, c: Record<string, unknown>) => Promise<unknown> })
-      .fetchPortfolio(mockPage as unknown as Page, { username: 'u', password: 'p' });
+    const result = await (
+      scraper as unknown as { fetchPortfolio: (p: Page, c: Record<string, unknown>) => Promise<unknown> }
+    ).fetchPortfolio(mockPage as unknown as Page, { username: 'u', password: 'p' });
 
     // positions/cash are placeholder empty arrays until live holdings page selectors are added
     expect(result).toMatchObject({ positions: [], cash: [] });
@@ -67,12 +63,13 @@ describe('PsagotScraper', () => {
     const mockPage = makeMockPage();
 
     const scraper = new PsagotScraper({});
-    await (scraper as unknown as { fetchPortfolio: (p: Page, c: Record<string, unknown>) => Promise<unknown> })
-      .fetchPortfolio(mockPage as unknown as Page, {
-        username: 'u',
-        password: 'p',
-        otpCodeRetriever: mockOtpRetriever,
-      });
+    await (
+      scraper as unknown as { fetchPortfolio: (p: Page, c: Record<string, unknown>) => Promise<unknown> }
+    ).fetchPortfolio(mockPage as unknown as Page, {
+      username: 'u',
+      password: 'p',
+      otpCodeRetriever: mockOtpRetriever,
+    });
 
     expect(mockOtpRetriever).toHaveBeenCalledTimes(1);
   });
@@ -81,8 +78,9 @@ describe('PsagotScraper', () => {
     const mockPage = makeMockPage();
     const scraper = new PsagotScraper({});
     await expect(
-      (scraper as unknown as { fetchPortfolio: (p: Page, c: Record<string, unknown>) => Promise<unknown> })
-        .fetchPortfolio(mockPage as unknown as Page, { username: 'u', password: 'p' }),
+      (
+        scraper as unknown as { fetchPortfolio: (p: Page, c: Record<string, unknown>) => Promise<unknown> }
+      ).fetchPortfolio(mockPage as unknown as Page, { username: 'u', password: 'p' }),
     ).resolves.not.toThrow();
   });
 });
