@@ -32,12 +32,20 @@ async function flutterClickByText(page: Page, text: string): Promise<void> {
   }, text);
 }
 
-// Runs a fetch from inside the browser (so session cookies are automatically included).
-async function apiFetch(page: Page, url: string): Promise<unknown> {
-  return page.evaluate(async (u: string) => {
-    const res = await fetch(u, { credentials: 'include' });
-    return res.json() as unknown;
-  }, url);
+// Fetches a Psagot API URL from Node.js (not the browser) using cookies extracted from the session.
+// This bypasses CORS since it's a server-side request.
+async function nodeFetch(page: Page, url: string): Promise<unknown> {
+  const cookies = await page.cookies();
+  const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+  const res = await fetch(url, {
+    headers: {
+      Cookie: cookieStr,
+      Referer: LOGIN_URL,
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    },
+  });
+  return res.json() as unknown;
 }
 
 export class PsagotScraper extends BasePortfolioScraper {
@@ -122,8 +130,8 @@ export class PsagotScraper extends BasePortfolioScraper {
     // eslint-disable-next-line no-console
     console.log('[psagot-scraper] navigated to:', await page.evaluate(() => location.href));
 
-    // ── 5. Fetch accounts ─────────────────────────────────────────────────────────
-    const accountsRes = (await apiFetch(page, `${BASE_URL}/V2/json/accounts?catalog=unified`)) as {
+    // ── 5. Fetch accounts via Node.js fetch (bypasses CORS) ───────────────────────
+    const accountsRes = (await nodeFetch(page, `${BASE_URL}/V2/json/accounts?catalog=unified`)) as {
       UserAccounts?: { UserAccount?: Array<{ '-key': string }> | { '-key': string } };
     };
     const rawAccounts = accountsRes?.UserAccounts?.UserAccount;
@@ -133,30 +141,34 @@ export class PsagotScraper extends BasePortfolioScraper {
     // eslint-disable-next-line no-console
     console.log('[psagot-scraper] accounts:', accountIds);
 
-    // ── 6. Fetch balances for each account (contains positions + cash) ────────────
+    // ── 6. Fetch full balances for each account ───────────────────────────────────
     const allPositions: PortfolioPosition[] = [];
     let totalCashIls = 0;
 
     for (const accountId of accountIds) {
-      const balancesRes = await apiFetch(
+      const balancesRes = await nodeFetch(
         page,
         `${BASE_URL}/V2/json2/account/view/balances?account=${accountId}&fields=hebName&currency=ils&catalog=unified`,
       );
+      // Log the FULL response so we can see what the balances endpoint returns
       // eslint-disable-next-line no-console
       console.log(`[psagot-scraper] balances ${accountId}:`, JSON.stringify(balancesRes));
 
       const account = (balancesRes as { View?: { Account?: Record<string, unknown> } })?.View?.Account;
-      if (!account) continue;
+      if (!account) {
+        // eslint-disable-next-line no-console
+        console.log('[psagot-scraper] no Account in balances response — raw:', JSON.stringify(balancesRes));
+        continue;
+      }
 
-      // Cash
-      const cash = Number(account['OnlineCash'] ?? account['MorningCash'] ?? 0);
-      totalCashIls += cash;
+      totalCashIls += Number(account['OnlineCash'] ?? account['MorningCash'] ?? 0);
 
-      // Positions — look for a Portfolio or Securities sub-object
+      // Positions may be in a Portfolio/Securities sub-object within the account.
+      // We log the full response above, so after seeing the output we can refine this.
       const portfolioSection =
         account['Portfolio'] ?? account['Securities'] ?? account['Positions'] ?? account['Holdings'];
       // eslint-disable-next-line no-console
-      console.log(`[psagot-scraper] portfolio section for ${accountId}:`, JSON.stringify(portfolioSection));
+      console.log(`[psagot-scraper] portfolio section keys for ${accountId}:`, Object.keys(account).join(', '));
 
       const rawSecurities = (() => {
         if (!portfolioSection) return [];
@@ -170,7 +182,7 @@ export class PsagotScraper extends BasePortfolioScraper {
       })();
 
       // eslint-disable-next-line no-console
-      console.log(`[psagot-scraper] account ${accountId}: ${rawSecurities.length} raw securities`);
+      console.log(`[psagot-scraper] account ${accountId}: ${rawSecurities.length} securities`);
 
       for (const sec of rawSecurities) {
         const strVal = (...keys: string[]): string => {
@@ -185,7 +197,7 @@ export class PsagotScraper extends BasePortfolioScraper {
         const name = strVal('HebName', 'EngName', 'Name') || secId;
         const qty = Number(sec['Quantity'] ?? sec['qty'] ?? sec['Amount'] ?? 0);
         const price = Number(sec['Rate'] ?? sec['Price'] ?? sec['LastRate'] ?? 0);
-        const avgCost = Number(sec['AvgCost'] ?? sec['AverageCost'] ?? sec['avgRate'] ?? 0);
+        const avgCost = Number(sec['AvgCost'] ?? sec['AverageCost'] ?? 0);
         const pnl = Number(sec['ProfitLoss'] ?? sec['UnrealizedPnl'] ?? 0);
         if (qty === 0) continue;
         allPositions.push({
@@ -204,7 +216,6 @@ export class PsagotScraper extends BasePortfolioScraper {
     console.log(`[psagot-scraper] done — ${allPositions.length} positions, cash ${totalCashIls} ILS`);
 
     const cash: PortfolioCash[] = totalCashIls > 0 ? [{ currency: 'ILS', amount: totalCashIls }] : [];
-    const asOfDate = new Date().toISOString().slice(0, 10);
-    return { positions: allPositions, cash, asOfDate };
+    return { positions: allPositions, cash, asOfDate: new Date().toISOString().slice(0, 10) };
   }
 }
