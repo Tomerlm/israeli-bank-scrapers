@@ -9,8 +9,8 @@ describe('createPortfolioScraper', () => {
   });
 
   test('throws for an unrecognised companyId', () => {
-    expect(() =>
-      createPortfolioScraper({ companyId: 'unknown' as PortfolioCompanyTypes }),
-    ).toThrow('Unknown portfolio company: unknown');
+    expect(() => createPortfolioScraper({ companyId: 'unknown' as PortfolioCompanyTypes })).toThrow(
+      'Unknown portfolio company: unknown',
+    );
   });
 });
