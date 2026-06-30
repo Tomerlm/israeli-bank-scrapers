@@ -59,6 +59,22 @@ async function extractAccountData(page: Page): Promise<{
     timeout: 60_000,
   });
 
+  // Dump all role="img" aria-labels and a sample of all text for diagnostics
+  const debugInfo = await page.evaluate(() => ({
+    imgAriaLabels: Array.from(document.querySelectorAll('flt-semantics[role="img"]'))
+      .map(el => el.getAttribute('aria-label'))
+      .filter(Boolean)
+      .slice(0, 30),
+    allRoles: Array.from(document.querySelectorAll('flt-semantics[role]'))
+      .map(el => `${el.getAttribute('role')}|${(el.getAttribute('aria-label') ?? el.textContent ?? '').slice(0, 80)}`)
+      .filter(Boolean)
+      .slice(0, 40),
+  }));
+  // eslint-disable-next-line no-console
+  console.log('[psagot-scraper] img aria-labels:', JSON.stringify(debugInfo.imgAriaLabels));
+  // eslint-disable-next-line no-console
+  console.log('[psagot-scraper] all roles sample:', JSON.stringify(debugInfo.allRoles));
+
   return page.evaluate(() => {
     // Current account ID from the profile menu button text ("Profile menu\n150-259840")
     const profileBtn = Array.from(document.querySelectorAll('flt-semantics[role="button"]')).find(el =>
