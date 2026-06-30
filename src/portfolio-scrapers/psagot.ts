@@ -56,7 +56,7 @@ async function extractAccountData(page: Page): Promise<{
   cash: PortfolioCash[];
 }> {
   await page.waitForFunction(() => document.querySelectorAll('flt-semantics[role="img"]').length > 0, {
-    timeout: 30_000,
+    timeout: 60_000,
   });
 
   return page.evaluate(() => {
@@ -300,6 +300,9 @@ async function switchAccount(page: Page, targetAccountId: string): Promise<void>
     { timeout: 30_000 },
     targetAccountId,
   );
+
+  // Give Flutter time to re-render the portfolio after the account switch
+  await new Promise(r => setTimeout(r, 3_000));
 }
 
 export class PsagotScraper extends BasePortfolioScraper {
