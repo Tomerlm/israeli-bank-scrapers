@@ -2,6 +2,7 @@ import { type Page } from 'puppeteer';
 import { BasePortfolioScraper } from './base-portfolio-scraper';
 import type { PortfolioCash, PortfolioPosition } from './interface';
 
+const BASE_URL = 'https://trade1.psagot.co.il';
 const LOGIN_URL = 'https://trade.psagot.co.il/';
 
 const SEL = {
@@ -31,25 +32,12 @@ async function flutterClickByText(page: Page, text: string): Promise<void> {
   }, text);
 }
 
-// Heuristic: does this JSON body look like a portfolio holdings response?
-// We look for an array of objects that each have a numeric quantity field.
-function looksLikeHoldings(body: unknown): boolean {
-  const candidates = [
-    body,
-    ...(typeof body === 'object' && body !== null ? Object.values(body as Record<string, unknown>) : []),
-  ];
-  for (const candidate of candidates) {
-    if (!Array.isArray(candidate) || candidate.length === 0) continue;
-    const first = candidate[0] as Record<string, unknown>;
-    if (
-      typeof first === 'object' &&
-      first !== null &&
-      Object.keys(first).some(k => /qty|quantity|amount|units|shares/i.test(k))
-    ) {
-      return true;
-    }
-  }
-  return false;
+// Runs a fetch from inside the browser (so session cookies are automatically included).
+async function apiFetch(page: Page, url: string): Promise<unknown> {
+  return page.evaluate(async (u: string) => {
+    const res = await fetch(u, { credentials: 'include' });
+    return res.json() as unknown;
+  }, url);
 }
 
 export class PsagotScraper extends BasePortfolioScraper {
@@ -60,17 +48,6 @@ export class PsagotScraper extends BasePortfolioScraper {
     const username = typeof credentials['username'] === 'string' ? credentials['username'] : '';
     const password = typeof credentials['password'] === 'string' ? credentials['password'] : '';
     const otpCodeRetriever = credentials['otpCodeRetriever'] as (() => Promise<string>) | undefined;
-
-    // Capture all JSON API responses made by the Flutter app after login.
-    const capturedApis: Array<{ url: string; body: unknown }> = [];
-    page.on('response', response => {
-      const ct = response.headers()['content-type'] ?? '';
-      if (!ct.includes('json')) return;
-      void response
-        .json()
-        .then((body: unknown) => capturedApis.push({ url: response.url(), body }))
-        .catch(() => undefined);
-    });
 
     // ── 1. Boot Flutter ──────────────────────────────────────────────────────────
     await page.setUserAgent(
@@ -138,107 +115,96 @@ export class PsagotScraper extends BasePortfolioScraper {
       }
     }
 
-    // ── 4. Wait for portfolio page + let API calls settle ────────────────────────
+    // ── 4. Wait for portfolio page ────────────────────────────────────────────────
     await page.waitForFunction(() => !location.href.includes('/login') && !location.href.endsWith('/'), {
       timeout: 60_000,
     });
     // eslint-disable-next-line no-console
     console.log('[psagot-scraper] navigated to:', await page.evaluate(() => location.href));
 
-    // Give the Flutter app time to load portfolio data from its backend APIs
-    await new Promise(r => setTimeout(r, 4_000));
-
-    // ── 5. Extract data from captured API responses ───────────────────────────────
+    // ── 5. Fetch accounts ─────────────────────────────────────────────────────────
+    const accountsRes = (await apiFetch(page, `${BASE_URL}/V2/json/accounts?catalog=unified`)) as {
+      UserAccounts?: { UserAccount?: Array<{ '-key': string }> | { '-key': string } };
+    };
+    const rawAccounts = accountsRes?.UserAccounts?.UserAccount;
+    const accountIds = (Array.isArray(rawAccounts) ? rawAccounts : rawAccounts ? [rawAccounts] : []).map(
+      a => a['-key'],
+    );
     // eslint-disable-next-line no-console
-    console.log('[psagot-scraper] captured API responses:', capturedApis.length);
-    for (const api of capturedApis) {
-      // eslint-disable-next-line no-console
-      console.log(`[psagot-scraper] API ${api.url} → ${JSON.stringify(api.body).slice(0, 300)}`);
-    }
+    console.log('[psagot-scraper] accounts:', accountIds);
 
-    // Find the holdings response: an array of objects with quantity-like fields.
-    const holdingsApi = capturedApis.find(r => looksLikeHoldings(r.body));
-    if (!holdingsApi) {
-      // Log all response URLs so we can identify the right one manually
-      const urls = capturedApis.map(r => r.url).join('\n  ');
-      throw new Error(
-        `[psagot-scraper] Could not detect portfolio holdings in captured API responses.\nCaptured URLs:\n  ${urls}`,
+    // ── 6. Fetch balances for each account (contains positions + cash) ────────────
+    const allPositions: PortfolioPosition[] = [];
+    let totalCashIls = 0;
+
+    for (const accountId of accountIds) {
+      const balancesRes = await apiFetch(
+        page,
+        `${BASE_URL}/V2/json2/account/view/balances?account=${accountId}&fields=hebName&currency=ils&catalog=unified`,
       );
-    }
-
-    // eslint-disable-next-line no-console
-    console.log('[psagot-scraper] holdings API:', holdingsApi.url);
-    // eslint-disable-next-line no-console
-    console.log('[psagot-scraper] holdings body:', JSON.stringify(holdingsApi.body).slice(0, 600));
-
-    // ── 6. Map holdings → PortfolioPosition[] ────────────────────────────────────
-    // Extract the array from the response (handles both top-level array and wrapped {data:[...]})
-    const rawRows: Record<string, unknown>[] = (() => {
-      const body = holdingsApi.body;
-      if (Array.isArray(body)) return body as Record<string, unknown>[];
-      if (typeof body === 'object' && body !== null) {
-        for (const v of Object.values(body as Record<string, unknown>)) {
-          if (Array.isArray(v)) return v as Record<string, unknown>[];
-        }
-      }
-      return [];
-    })();
-
-    // eslint-disable-next-line no-console
-    console.log('[psagot-scraper] position rows:', rawRows.length);
-    if (rawRows.length > 0) {
       // eslint-disable-next-line no-console
-      console.log('[psagot-scraper] first row keys:', Object.keys(rawRows[0] ?? {}).join(', '));
-    }
+      console.log(`[psagot-scraper] balances ${accountId}:`, JSON.stringify(balancesRes));
 
-    function strField(row: Record<string, unknown>, ...keys: string[]): string {
-      for (const k of keys) {
-        const v = row[k];
-        if (typeof v === 'string') return v;
-        if (typeof v === 'number') return String(v);
+      const account = (balancesRes as { View?: { Account?: Record<string, unknown> } })?.View?.Account;
+      if (!account) continue;
+
+      // Cash
+      const cash = Number(account['OnlineCash'] ?? account['MorningCash'] ?? 0);
+      totalCashIls += cash;
+
+      // Positions — look for a Portfolio or Securities sub-object
+      const portfolioSection =
+        account['Portfolio'] ?? account['Securities'] ?? account['Positions'] ?? account['Holdings'];
+      // eslint-disable-next-line no-console
+      console.log(`[psagot-scraper] portfolio section for ${accountId}:`, JSON.stringify(portfolioSection));
+
+      const rawSecurities = (() => {
+        if (!portfolioSection) return [];
+        if (Array.isArray(portfolioSection)) return portfolioSection as Record<string, unknown>[];
+        const inner =
+          (portfolioSection as Record<string, unknown>)['Security'] ??
+          (portfolioSection as Record<string, unknown>)['Position'];
+        if (Array.isArray(inner)) return inner as Record<string, unknown>[];
+        if (inner && typeof inner === 'object') return [inner as Record<string, unknown>];
+        return [];
+      })();
+
+      // eslint-disable-next-line no-console
+      console.log(`[psagot-scraper] account ${accountId}: ${rawSecurities.length} raw securities`);
+
+      for (const sec of rawSecurities) {
+        const strVal = (...keys: string[]): string => {
+          for (const k of keys) {
+            const v = sec[k];
+            if (typeof v === 'string') return v;
+            if (typeof v === 'number') return String(v);
+          }
+          return '';
+        };
+        const secId = strVal('-Key', 'Key', 'SecurityId', 'EquityNum');
+        const name = strVal('HebName', 'EngName', 'Name') || secId;
+        const qty = Number(sec['Quantity'] ?? sec['qty'] ?? sec['Amount'] ?? 0);
+        const price = Number(sec['Rate'] ?? sec['Price'] ?? sec['LastRate'] ?? 0);
+        const avgCost = Number(sec['AvgCost'] ?? sec['AverageCost'] ?? sec['avgRate'] ?? 0);
+        const pnl = Number(sec['ProfitLoss'] ?? sec['UnrealizedPnl'] ?? 0);
+        if (qty === 0) continue;
+        allPositions.push({
+          identifier: `psagot-${secId}`,
+          name: `${name} (${accountId})`,
+          quantity: qty,
+          price,
+          avgCost,
+          unrealizedPnl: pnl,
+          currency: 'ILS',
+        });
       }
-      return '';
     }
-    const positions: PortfolioPosition[] = rawRows
-      .map(row => {
-        // Field names are discovered from the first log run — update these after seeing the actual keys.
-        const secId = strField(row, 'securityId', 'SecurityId', 'security_id', 'EquityNum', 'id');
-        const name = strField(row, 'name', 'Name', 'HebName', 'EngName') || secId;
-        const qty = Number(row['quantity'] ?? row['Quantity'] ?? row['qty'] ?? row['units'] ?? row['amount'] ?? 0);
-        const price = Number(row['price'] ?? row['Price'] ?? row['LastRate'] ?? row['lastRate'] ?? row['rate'] ?? 0);
-        const avgCost = Number(row['avgCost'] ?? row['AvgCost'] ?? row['avg_cost'] ?? row['avgRate'] ?? 0);
-        const pnl = Number(row['unrealizedPnl'] ?? row['UnrealizedPnl'] ?? row['profitLoss'] ?? row['ProfitLoss'] ?? 0);
-        const currency = strField(row, 'currency', 'Currency', 'CurrencyCode') || 'ILS';
-        return { secId, name, qty, price, avgCost, pnl, currency };
-      })
-      .filter(r => r.qty !== 0)
-      .map(r => ({
-        identifier: `psagot-${r.secId}`,
-        name: r.name,
-        quantity: r.qty,
-        price: r.price,
-        avgCost: r.avgCost,
-        unrealizedPnl: r.pnl,
-        currency: r.currency as 'ILS' | 'USD',
-      }));
-
-    // ── 7. Cash: look for a response containing cash/balance data ─────────────────
-    let cashIls = 0;
-    const cashApi = capturedApis.find(r => {
-      const s = JSON.stringify(r.body).toLowerCase();
-      return s.includes('cash') || s.includes('buyingpower') || s.includes('buying_power');
-    });
-    if (cashApi) {
-      const s = JSON.stringify(cashApi.body);
-      const m = s.match(/"(?:cash|buyingPower|BuyingPower|buying_power)"\s*:\s*([\d.]+)/);
-      if (m) cashIls = parseFloat(m[1]);
-    }
-
-    const cash: PortfolioCash[] = cashIls > 0 ? [{ currency: 'ILS', amount: cashIls }] : [];
-    const asOfDate = new Date().toISOString().slice(0, 10);
 
     // eslint-disable-next-line no-console
-    console.log(`[psagot-scraper] done — ${positions.length} positions, cash ${cashIls} ILS`);
-    return { positions, cash, asOfDate };
+    console.log(`[psagot-scraper] done — ${allPositions.length} positions, cash ${totalCashIls} ILS`);
+
+    const cash: PortfolioCash[] = totalCashIls > 0 ? [{ currency: 'ILS', amount: totalCashIls }] : [];
+    const asOfDate = new Date().toISOString().slice(0, 10);
+    return { positions: allPositions, cash, asOfDate };
   }
 }
