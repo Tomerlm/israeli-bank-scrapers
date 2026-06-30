@@ -147,6 +147,35 @@ async function extractAccountData(page: Page): Promise<{
   });
 }
 
+// Dismisses the "Welcome to the New Psagot Trade" onboarding overlay if present.
+async function dismissWelcomeDialogIfPresent(page: Page): Promise<void> {
+  const hasDialog = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('flt-semantics')).some(el =>
+      el.textContent?.includes('Welcome to the New Psagot Trade'),
+    ),
+  );
+  if (!hasDialog) return;
+
+  // eslint-disable-next-line no-console
+  console.log('[psagot-scraper] welcome dialog detected — clicking Skip');
+  await page.evaluate(() => {
+    const el = Array.from(document.querySelectorAll('flt-semantics')).find(
+      node => node.textContent?.trim() === 'Skip',
+    ) as HTMLElement | null;
+    if (el) el.click();
+  });
+
+  await page.waitForFunction(
+    () =>
+      !Array.from(document.querySelectorAll('flt-semantics')).some(el =>
+        el.textContent?.includes('Welcome to the New Psagot Trade'),
+      ),
+    { timeout: 10_000 },
+  );
+  // eslint-disable-next-line no-console
+  console.log('[psagot-scraper] welcome dialog dismissed');
+}
+
 // Opens the account switcher dropdown and returns all account IDs.
 async function getAllAccountIds(page: Page): Promise<string[]> {
   // Wait for Flutter a11y tree to be ready on the portfolio page before clicking
@@ -307,8 +336,8 @@ export class PsagotScraper extends BasePortfolioScraper {
     // eslint-disable-next-line no-console
     console.log('[psagot-scraper] navigated to:', await page.evaluate(() => location.href));
 
-    // 8. Get all account IDs from the profile dropdown and extract data from each.
-    //    Flutter a11y stays enabled from the login page — no re-enable needed.
+    // 8. Dismiss onboarding overlay if shown, then collect accounts.
+    await dismissWelcomeDialogIfPresent(page);
     const accountIds = await getAllAccountIds(page);
     // eslint-disable-next-line no-console
     console.log('[psagot-scraper] accounts found:', accountIds);
