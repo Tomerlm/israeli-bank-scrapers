@@ -148,7 +148,19 @@ async function extractAccountData(page: Page): Promise<{
 }
 
 // Dismisses the "Welcome to the New Psagot Trade" onboarding overlay if present.
+// Waits for the page to settle into either the welcome dialog or the portfolio view before deciding.
 async function dismissWelcomeDialogIfPresent(page: Page): Promise<void> {
+  // Wait until Flutter renders either the welcome dialog OR the profile menu button
+  await page.waitForFunction(
+    () =>
+      Array.from(document.querySelectorAll('flt-semantics')).some(
+        el =>
+          el.textContent?.includes('Welcome to the New Psagot Trade') ||
+          el.textContent?.includes('Profile menu'),
+      ),
+    { timeout: 30_000 },
+  );
+
   const hasDialog = await page.evaluate(() =>
     Array.from(document.querySelectorAll('flt-semantics')).some(el =>
       el.textContent?.includes('Welcome to the New Psagot Trade'),
