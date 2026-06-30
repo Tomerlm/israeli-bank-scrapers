@@ -348,6 +348,17 @@ export class PsagotScraper extends BasePortfolioScraper {
     const password = typeof credentials['password'] === 'string' ? credentials['password'] : '';
     const otpCodeRetriever = credentials['otpCodeRetriever'] as (() => Promise<string>) | undefined;
 
+    // Intercept JSON API responses to discover portfolio data endpoints
+    const capturedApis: Array<{ url: string; body: unknown }> = [];
+    page.on('response', response => {
+      const ct = response.headers()['content-type'] ?? '';
+      if (!ct.includes('json')) return;
+      void response
+        .json()
+        .then((body: unknown) => capturedApis.push({ url: response.url(), body }))
+        .catch(() => undefined);
+    });
+
     // 1. Navigate and wait for Flutter WASM to boot
     await page.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -425,6 +436,16 @@ export class PsagotScraper extends BasePortfolioScraper {
 
     // 8. Dismiss onboarding overlay if shown, then collect accounts.
     await dismissWelcomeDialogIfPresent(page);
+    // Give extra time for background API calls to complete
+    await new Promise(r => setTimeout(r, 2_000));
+    // eslint-disable-next-line no-console
+    console.log('[psagot-scraper] captured API calls:', capturedApis.length);
+    for (const api of capturedApis) {
+      // eslint-disable-next-line no-console
+      console.log(`[psagot-scraper] API: ${api.url}`);
+      // eslint-disable-next-line no-console
+      console.log(`[psagot-scraper] API body: ${JSON.stringify(api.body).slice(0, 400)}`);
+    }
     const accountIds = await getAllAccountIds(page);
     // eslint-disable-next-line no-console
     console.log('[psagot-scraper] accounts found:', accountIds);
