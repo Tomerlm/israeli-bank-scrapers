@@ -59,21 +59,26 @@ async function extractAccountData(page: Page): Promise<{
     timeout: 60_000,
   });
 
-  // Dump all role="img" aria-labels and a sample of all text for diagnostics
-  const debugInfo = await page.evaluate(() => ({
-    imgAriaLabels: Array.from(document.querySelectorAll('flt-semantics[role="img"]'))
-      .map(el => el.getAttribute('aria-label'))
-      .filter(Boolean)
-      .slice(0, 30),
-    allRoles: Array.from(document.querySelectorAll('flt-semantics[role]'))
-      .map(el => `${el.getAttribute('role')}|${(el.getAttribute('aria-label') ?? el.textContent ?? '').slice(0, 80)}`)
-      .filter(Boolean)
-      .slice(0, 40),
-  }));
+  // Comprehensive DOM dump for diagnosing position extraction
+  const debugInfo = await page.evaluate(() => {
+    const allLeaves = Array.from(document.querySelectorAll('flt-semantics'))
+      .filter(el => !el.querySelector('flt-semantics') && el.textContent?.trim())
+      .map(el => el.textContent?.trim() ?? '')
+      .filter(Boolean);
+    const allRoles = Array.from(document.querySelectorAll('flt-semantics[role]'))
+      .map(el => `${el.getAttribute('role')}|${(el.getAttribute('aria-label') ?? el.textContent ?? '').slice(0, 120)}`)
+      .filter(Boolean);
+    const groupEls = Array.from(document.querySelectorAll('flt-semantics[role="group"]')).map(el =>
+      el.textContent?.trim()?.slice(0, 200),
+    );
+    return { allLeaves, allRoles, groupEls };
+  });
   // eslint-disable-next-line no-console
-  console.log('[psagot-scraper] img aria-labels:', JSON.stringify(debugInfo.imgAriaLabels));
+  console.log('[psagot-scraper] all leaves:', JSON.stringify(debugInfo.allLeaves));
   // eslint-disable-next-line no-console
-  console.log('[psagot-scraper] all roles sample:', JSON.stringify(debugInfo.allRoles));
+  console.log('[psagot-scraper] all roles:', JSON.stringify(debugInfo.allRoles));
+  // eslint-disable-next-line no-console
+  console.log('[psagot-scraper] groups:', JSON.stringify(debugInfo.groupEls));
 
   return page.evaluate(() => {
     // Current account ID from the profile menu button text ("Profile menu\n150-259840")
