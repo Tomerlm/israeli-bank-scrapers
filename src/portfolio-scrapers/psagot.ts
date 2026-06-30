@@ -283,9 +283,22 @@ async function switchAccount(page: Page, targetAccountId: string): Promise<void>
   );
 
   await page.evaluate((id: string) => {
-    const el = Array.from(document.querySelectorAll('flt-semantics')).find(el =>
-      el.textContent?.includes(id),
-    ) as HTMLElement | null;
+    // Prefer role="button" elements (actual clickable items in the dropdown).
+    // Fall back to the deepest flt-semantics element containing the id (last in DOM order = deepest).
+    const buttons = Array.from(document.querySelectorAll('flt-semantics[role="button"]'));
+    const btn = buttons.find(el => el.textContent?.includes(id)) as HTMLElement | null;
+    if (btn) {
+      // eslint-disable-next-line no-console
+      console.log('[psagot-scraper] switching account via button:', btn.textContent?.trim().slice(0, 80));
+      btn.click();
+      return;
+    }
+    const all = Array.from(document.querySelectorAll('flt-semantics')).filter(el =>
+      (el.textContent ?? '').includes(id),
+    );
+    const el = all[all.length - 1] as HTMLElement | null;
+    // eslint-disable-next-line no-console
+    console.log('[psagot-scraper] switching account via fallback element:', el?.textContent?.trim().slice(0, 80));
     el?.click();
   }, targetAccountId);
 
