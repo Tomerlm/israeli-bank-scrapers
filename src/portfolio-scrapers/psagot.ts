@@ -36,7 +36,6 @@ async function apiFetch(page: Page, sessionKey: string, url: string): Promise<un
     async (targetUrl: string, key: string) => {
       const res = await fetch(targetUrl, {
         headers: { session: key, csession: String(Math.random()) },
-        credentials: 'include',
       });
       if (!res.ok) throw new Error(`HTTP ${res.status} from ${targetUrl}`);
       return res.json();
