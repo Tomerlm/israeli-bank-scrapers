@@ -154,9 +154,7 @@ async function dismissWelcomeDialogIfPresent(page: Page): Promise<void> {
   await page.waitForFunction(
     () =>
       Array.from(document.querySelectorAll('flt-semantics')).some(
-        el =>
-          el.textContent?.includes('Welcome to the New Psagot Trade') ||
-          el.textContent?.includes('Profile menu'),
+        el => el.textContent?.includes('Welcome to the New Psagot Trade') || el.textContent?.includes('Profile menu'),
       ),
     { timeout: 30_000 },
   );
@@ -168,21 +166,37 @@ async function dismissWelcomeDialogIfPresent(page: Page): Promise<void> {
   );
   if (!hasDialog) return;
 
+  // The dialog container appears before its child buttons are added to the a11y tree —
+  // wait explicitly for the Skip button to render before trying to click it.
+  await page
+    .waitForFunction(
+      () =>
+        Array.from(document.querySelectorAll('flt-semantics[role="button"]')).some(
+          node => node.textContent?.trim() === 'Skip',
+        ),
+      { timeout: 15_000 },
+    )
+    .catch(async (err: unknown) => {
+      const buttons = await page.evaluate(() =>
+        Array.from(document.querySelectorAll('flt-semantics[role="button"]'))
+          .map(el => el.textContent?.trim())
+          .filter(Boolean),
+      );
+      // eslint-disable-next-line no-console
+      console.log('[psagot-scraper] Skip button not found. Available buttons:', JSON.stringify(buttons));
+      throw err;
+    });
+
   // eslint-disable-next-line no-console
   console.log('[psagot-scraper] welcome dialog detected — clicking Skip');
-  await page.evaluate(() => {
-    const el = Array.from(document.querySelectorAll('flt-semantics')).find(
-      node => node.textContent?.trim() === 'Skip',
-    ) as HTMLElement | null;
-    if (el) el.click();
-  });
+  await flutterClickByText(page, 'Skip');
 
   await page.waitForFunction(
     () =>
       !Array.from(document.querySelectorAll('flt-semantics')).some(el =>
         el.textContent?.includes('Welcome to the New Psagot Trade'),
       ),
-    { timeout: 10_000 },
+    { timeout: 20_000 },
   );
   // eslint-disable-next-line no-console
   console.log('[psagot-scraper] welcome dialog dismissed');
@@ -210,17 +224,22 @@ async function getAllAccountIds(page: Page): Promise<string[]> {
 
   // eslint-disable-next-line no-console
   console.log('[psagot-scraper] waiting for account IDs in dropdown...');
-  await page.waitForFunction(
-    () => Array.from(document.querySelectorAll('flt-semantics')).some(el => /\d{3}-\d{6}/.test(el.textContent ?? '')),
-    { timeout: 10_000 },
-  ).catch(async (err) => {
-    const allText = await page.evaluate(() =>
-      Array.from(document.querySelectorAll('flt-semantics')).map(el => el.textContent?.trim()).filter(Boolean).slice(0, 50),
-    );
-    // eslint-disable-next-line no-console
-    console.log('[psagot-scraper] flt-semantics text samples (first 50):', JSON.stringify(allText));
-    throw err;
-  });
+  await page
+    .waitForFunction(
+      () => Array.from(document.querySelectorAll('flt-semantics')).some(el => /\d{3}-\d{6}/.test(el.textContent ?? '')),
+      { timeout: 10_000 },
+    )
+    .catch(async err => {
+      const allText = await page.evaluate(() =>
+        Array.from(document.querySelectorAll('flt-semantics'))
+          .map(el => el.textContent?.trim())
+          .filter(Boolean)
+          .slice(0, 50),
+      );
+      // eslint-disable-next-line no-console
+      console.log('[psagot-scraper] flt-semantics text samples (first 50):', JSON.stringify(allText));
+      throw err;
+    });
 
   const ids = await page.evaluate(() =>
     Array.from(document.querySelectorAll('flt-semantics'))
