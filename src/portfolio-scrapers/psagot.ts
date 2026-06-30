@@ -123,16 +123,20 @@ export class PsagotScraper extends BasePortfolioScraper {
         console.log('[psagot-scraper] OTP required');
         const code = await otpCodeRetriever();
         await page.type(`input[aria-label="${otpAriaLabel}"]`, code);
-        await page.waitForFunction(
-          () => {
-            const btn = Array.from(document.querySelectorAll('flt-semantics[role="button"]')).find(
-              el => el.textContent?.trim() === 'Login',
-            );
-            return btn != null && btn.getAttribute('aria-disabled') !== 'true';
-          },
-          { timeout: 30_000 },
-        );
-        await flutterClickByText(page, 'Login');
+        // Flutter may auto-submit after all OTP digits are entered.
+        // Try clicking Login only if it becomes active within 5s; ignore if it doesn't.
+        await page
+          .waitForFunction(
+            () => {
+              const btn = Array.from(document.querySelectorAll('flt-semantics[role="button"]')).find(
+                el => el.textContent?.trim() === 'Login',
+              );
+              return btn != null && btn.getAttribute('aria-disabled') !== 'true';
+            },
+            { timeout: 5_000 },
+          )
+          .then(() => flutterClickByText(page, 'Login'))
+          .catch(() => undefined);
       }
     }
 
