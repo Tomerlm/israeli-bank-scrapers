@@ -31,11 +31,19 @@ function strVal(v: unknown, fallback = ''): string {
   return fallback;
 }
 
-async function apiFetch(authHeaders: Record<string, string>, url: string): Promise<unknown> {
-  const res = await fetch(url, {
-    headers: { ...authHeaders, csession: String(Math.random()) },
-  });
-  return res.json() as unknown;
+async function apiFetch(page: Page, sessionKey: string, url: string): Promise<unknown> {
+  return page.evaluate(
+    async (targetUrl: string, key: string) => {
+      const res = await fetch(targetUrl, {
+        headers: { session: key, csession: String(Math.random()) },
+        credentials: 'include',
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status} from ${targetUrl}`);
+      return res.json();
+    },
+    url,
+    sessionKey,
+  );
 }
 
 export class PsagotScraper extends BasePortfolioScraper {
@@ -137,10 +145,8 @@ export class PsagotScraper extends BasePortfolioScraper {
 
     if (!sessionKey) throw new Error('Psagot login succeeded but SessionKey was not captured from response');
 
-    const authHeaders = { session: sessionKey, 'User-Agent': USER_AGENT, Referer: LOGIN_URL };
-
     // ── 6. Fetch accounts ─────────────────────────────────────────────────────
-    const accountsRes = (await apiFetch(authHeaders, `${BASE_URL}/V2/json/accounts?catalog=unified`)) as {
+    const accountsRes = (await apiFetch(page, sessionKey, `${BASE_URL}/V2/json/accounts?catalog=unified`)) as {
       UserAccounts?: { UserAccount?: Array<{ '-key': string }> | { '-key': string } };
     };
     const rawAccounts = accountsRes?.UserAccounts?.UserAccount;
@@ -156,7 +162,8 @@ export class PsagotScraper extends BasePortfolioScraper {
 
     for (const accountId of accountIds) {
       const balancesRes = (await apiFetch(
-        authHeaders,
+        page,
+        sessionKey,
         `${BASE_URL}/V2/json2/account/view/balances?account=${accountId}&fields=hebName&currency=ils&catalog=unified`,
       )) as {
         View?: {
