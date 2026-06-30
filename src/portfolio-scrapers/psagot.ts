@@ -140,9 +140,14 @@ export class PsagotScraper extends BasePortfolioScraper {
       }
     }
 
-    // ── 5. Wait for post-login navigation ────────────────────────────────────
-    await page.waitForFunction(() => !location.href.includes('/login') && !location.href.endsWith('/'), {
-      timeout: 60_000,
+    // ── 5. Wait for post-login SessionKey (polls Node.js variable set by response listener) ──
+    // URL-based heuristics fail for Flutter SPAs that stay at '/' after login.
+    await new Promise<void>((resolve, reject) => {
+      const deadline = Date.now() + 60_000;
+      const check = setInterval(() => {
+        if (sessionKey) { clearInterval(check); resolve(); return; }
+        if (Date.now() > deadline) { clearInterval(check); reject(new Error('Login timed out: no SessionKey received')); }
+      }, 500);
     });
     // eslint-disable-next-line no-console
     console.log('[psagot-scraper] logged in, sessionKey captured:', sessionKey ? 'yes' : 'NO');
