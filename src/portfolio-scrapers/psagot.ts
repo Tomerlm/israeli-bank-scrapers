@@ -166,30 +166,36 @@ async function dismissWelcomeDialogIfPresent(page: Page): Promise<void> {
   );
   if (!hasDialog) return;
 
-  // The dialog container appears before its child buttons are added to the a11y tree —
-  // wait explicitly for the Skip button to render before trying to click it.
-  await page
-    .waitForFunction(
-      () =>
-        Array.from(document.querySelectorAll('flt-semantics[role="button"]')).some(
-          node => node.textContent?.trim() === 'Skip',
-        ),
-      { timeout: 15_000 },
-    )
-    .catch(async (err: unknown) => {
-      const buttons = await page.evaluate(() =>
-        Array.from(document.querySelectorAll('flt-semantics[role="button"]'))
-          .map(el => el.textContent?.trim())
-          .filter(Boolean),
-      );
-      // eslint-disable-next-line no-console
-      console.log('[psagot-scraper] Skip button not found. Available buttons:', JSON.stringify(buttons));
-      throw err;
-    });
-
   // eslint-disable-next-line no-console
-  console.log('[psagot-scraper] welcome dialog detected — clicking Skip');
-  await flutterClickByText(page, 'Skip');
+  console.log('[psagot-scraper] welcome dialog detected — stepping through');
+
+  // The dialog may be a multi-step wizard (Next → Next → Skip/Close).
+  // Click whatever dismiss button is available each round until the dialog is gone.
+  const DISMISS_LABELS = ['Skip', 'Next', 'Close', 'Done', 'סגור', 'דלג'];
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const stillOpen = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('flt-semantics')).some(el =>
+        el.textContent?.includes('Welcome to the New Psagot Trade'),
+      ),
+    );
+    if (!stillOpen) break;
+
+    const clicked = await page.evaluate((labels: string[]) => {
+      const buttons = Array.from(document.querySelectorAll('flt-semantics[role="button"]'));
+      const btn = buttons.find(el => labels.includes(el.textContent?.trim() ?? '')) as HTMLElement | null;
+      if (btn) {
+        // eslint-disable-next-line no-console
+        console.log('[psagot-scraper] clicking dialog button:', btn.textContent?.trim());
+        btn.click();
+        return true;
+      }
+      return false;
+    }, DISMISS_LABELS);
+
+    if (!clicked) break;
+    // Give Flutter time to animate to the next dialog page
+    await new Promise(r => setTimeout(r, 1_500));
+  }
 
   await page.waitForFunction(
     () =>
