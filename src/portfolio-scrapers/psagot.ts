@@ -4,23 +4,16 @@ import type { PortfolioCash, PortfolioPosition } from './interface';
 
 const BASE_URL = 'https://trade1.psagot.co.il';
 const LOGIN_URL = 'https://trade.psagot.co.il/';
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 const SEL = {
   username: 'input[aria-label="Username required"]',
   password: 'input[aria-label="Password required"]',
-  termsCheckbox: 'flt-semantics[role="checkbox"]',
 } as const;
 
 async function waitForElement(page: Page, selector: string, timeout = 60_000): Promise<void> {
   await page.waitForFunction((sel: string) => document.querySelector(sel) !== null, { timeout }, selector);
-}
-
-async function enableA11y(page: Page): Promise<void> {
-  await waitForElement(page, 'flt-semantics-placeholder', 30_000);
-  await page.evaluate(() => {
-    const el = document.querySelector('flt-semantics-placeholder');
-    if (el instanceof HTMLElement) el.click();
-  });
 }
 
 async function flutterClickByText(page: Page, text: string): Promise<void> {
@@ -32,18 +25,15 @@ async function flutterClickByText(page: Page, text: string): Promise<void> {
   }, text);
 }
 
-// Fetches a Psagot API URL from Node.js (not the browser) using cookies extracted from the session.
-// This bypasses CORS since it's a server-side request.
-async function nodeFetch(page: Page, url: string): Promise<unknown> {
-  const cookies = await page.cookies();
-  const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+function strVal(v: unknown, fallback = ''): string {
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number') return String(v);
+  return fallback;
+}
+
+async function apiFetch(authHeaders: Record<string, string>, url: string): Promise<unknown> {
   const res = await fetch(url, {
-    headers: {
-      Cookie: cookieStr,
-      Referer: LOGIN_URL,
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    },
+    headers: { ...authHeaders, csession: String(Math.random()) },
   });
   return res.json() as unknown;
 }
@@ -57,17 +47,32 @@ export class PsagotScraper extends BasePortfolioScraper {
     const password = typeof credentials['password'] === 'string' ? credentials['password'] : '';
     const otpCodeRetriever = credentials['otpCodeRetriever'] as (() => Promise<string>) | undefined;
 
-    // ── 1. Boot Flutter ──────────────────────────────────────────────────────────
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    );
+    // ── 1. Set up login response interceptor to capture SessionKey ────────────
+    let sessionKey = '';
+    page.on('response', response => {
+      if (!response.url().includes('/login')) return;
+      void response
+        .json()
+        .then((body: unknown) => {
+          const key = (body as { Login?: { SessionKey?: string } })?.Login?.SessionKey;
+          if (key) sessionKey = key;
+        })
+        .catch(() => undefined);
+    });
+
+    // ── 2. Boot Flutter ───────────────────────────────────────────────────────
+    await page.setUserAgent(USER_AGENT);
     await page.goto(LOGIN_URL, { waitUntil: 'load', timeout: 120_000 });
     await waitForElement(page, 'flt-glass-pane', 120_000);
     // eslint-disable-next-line no-console
     console.log('[psagot-scraper] Flutter initialized');
 
-    // ── 2. Login ─────────────────────────────────────────────────────────────────
-    await enableA11y(page);
+    // ── 3. Login ──────────────────────────────────────────────────────────────
+    await waitForElement(page, 'flt-semantics-placeholder', 30_000);
+    await page.evaluate(() => {
+      const el = document.querySelector('flt-semantics-placeholder');
+      if (el instanceof HTMLElement) el.click();
+    });
     await waitForElement(page, SEL.username, 30_000);
     await page.type(SEL.username, username);
     await page.type(SEL.password, password);
@@ -94,7 +99,7 @@ export class PsagotScraper extends BasePortfolioScraper {
       timeout: 60_000,
     });
 
-    // ── 3. OTP (optional) ────────────────────────────────────────────────────────
+    // ── 4. OTP (optional) ─────────────────────────────────────────────────────
     const otpInputAppeared = await page
       .waitForFunction(() => document.querySelectorAll('input').length > 0, { timeout: 10_000 })
       .then(() => true)
@@ -123,15 +128,19 @@ export class PsagotScraper extends BasePortfolioScraper {
       }
     }
 
-    // ── 4. Wait for portfolio page ────────────────────────────────────────────────
+    // ── 5. Wait for post-login navigation ────────────────────────────────────
     await page.waitForFunction(() => !location.href.includes('/login') && !location.href.endsWith('/'), {
       timeout: 60_000,
     });
     // eslint-disable-next-line no-console
-    console.log('[psagot-scraper] navigated to:', await page.evaluate(() => location.href));
+    console.log('[psagot-scraper] logged in, sessionKey captured:', sessionKey ? 'yes' : 'NO');
 
-    // ── 5. Fetch accounts via Node.js fetch (bypasses CORS) ───────────────────────
-    const accountsRes = (await nodeFetch(page, `${BASE_URL}/V2/json/accounts?catalog=unified`)) as {
+    if (!sessionKey) throw new Error('Psagot login succeeded but SessionKey was not captured from response');
+
+    const authHeaders = { session: sessionKey, 'User-Agent': USER_AGENT, Referer: LOGIN_URL };
+
+    // ── 6. Fetch accounts ─────────────────────────────────────────────────────
+    const accountsRes = (await apiFetch(authHeaders, `${BASE_URL}/V2/json/accounts?catalog=unified`)) as {
       UserAccounts?: { UserAccount?: Array<{ '-key': string }> | { '-key': string } };
     };
     const rawAccounts = accountsRes?.UserAccounts?.UserAccount;
@@ -141,65 +150,54 @@ export class PsagotScraper extends BasePortfolioScraper {
     // eslint-disable-next-line no-console
     console.log('[psagot-scraper] accounts:', accountIds);
 
-    // ── 6. Fetch full balances for each account ───────────────────────────────────
+    // ── 7. Fetch balances for each account ────────────────────────────────────
     const allPositions: PortfolioPosition[] = [];
     let totalCashIls = 0;
 
     for (const accountId of accountIds) {
-      const balancesRes = await nodeFetch(
-        page,
+      const balancesRes = (await apiFetch(
+        authHeaders,
         `${BASE_URL}/V2/json2/account/view/balances?account=${accountId}&fields=hebName&currency=ils&catalog=unified`,
-      );
-      // Log the FULL response so we can see what the balances endpoint returns
-      // eslint-disable-next-line no-console
-      console.log(`[psagot-scraper] balances ${accountId}:`, JSON.stringify(balancesRes));
+      )) as {
+        View?: {
+          Account?: {
+            OnlineCash?: number;
+            AccountPosition?: { Balance?: Array<Record<string, unknown>> | Record<string, unknown> };
+          };
+          Meta?: { Security?: Array<{ '-Key': string; HebName?: string }> | { '-Key': string; HebName?: string } };
+        };
+      };
 
-      const account = (balancesRes as { View?: { Account?: Record<string, unknown> } })?.View?.Account;
+      const account = balancesRes?.View?.Account;
       if (!account) {
         // eslint-disable-next-line no-console
-        console.log('[psagot-scraper] no Account in balances response — raw:', JSON.stringify(balancesRes));
+        console.log(`[psagot-scraper] no Account in balances response for ${accountId}`);
         continue;
       }
 
-      totalCashIls += Number(account['OnlineCash'] ?? account['MorningCash'] ?? 0);
+      totalCashIls += Number(account.OnlineCash ?? 0);
 
-      // Positions may be in a Portfolio/Securities sub-object within the account.
-      // We log the full response above, so after seeing the output we can refine this.
-      const portfolioSection =
-        account['Portfolio'] ?? account['Securities'] ?? account['Positions'] ?? account['Holdings'];
+      // Build a map of security ID → name from Meta.Security
+      const rawMeta = balancesRes?.View?.Meta?.Security;
+      const metaSecurities = Array.isArray(rawMeta) ? rawMeta : rawMeta ? [rawMeta] : [];
+      const nameById = new Map<string, string>(metaSecurities.map(s => [s['-Key'], s.HebName ?? '']));
+
+      const rawBalances = account.AccountPosition?.Balance;
+      const balances = Array.isArray(rawBalances) ? rawBalances : rawBalances ? [rawBalances] : [];
       // eslint-disable-next-line no-console
-      console.log(`[psagot-scraper] portfolio section keys for ${accountId}:`, Object.keys(account).join(', '));
+      console.log(`[psagot-scraper] account ${accountId}: ${balances.length} positions`);
 
-      const rawSecurities = (() => {
-        if (!portfolioSection) return [];
-        if (Array.isArray(portfolioSection)) return portfolioSection as Record<string, unknown>[];
-        const inner =
-          (portfolioSection as Record<string, unknown>)['Security'] ??
-          (portfolioSection as Record<string, unknown>)['Position'];
-        if (Array.isArray(inner)) return inner as Record<string, unknown>[];
-        if (inner && typeof inner === 'object') return [inner as Record<string, unknown>];
-        return [];
-      })();
-
-      // eslint-disable-next-line no-console
-      console.log(`[psagot-scraper] account ${accountId}: ${rawSecurities.length} securities`);
-
-      for (const sec of rawSecurities) {
-        const strVal = (...keys: string[]): string => {
-          for (const k of keys) {
-            const v = sec[k];
-            if (typeof v === 'string') return v;
-            if (typeof v === 'number') return String(v);
-          }
-          return '';
-        };
-        const secId = strVal('-Key', 'Key', 'SecurityId', 'EquityNum');
-        const name = strVal('HebName', 'EngName', 'Name') || secId;
-        const qty = Number(sec['Quantity'] ?? sec['qty'] ?? sec['Amount'] ?? 0);
-        const price = Number(sec['Rate'] ?? sec['Price'] ?? sec['LastRate'] ?? 0);
-        const avgCost = Number(sec['AvgCost'] ?? sec['AverageCost'] ?? 0);
-        const pnl = Number(sec['ProfitLoss'] ?? sec['UnrealizedPnl'] ?? 0);
+      for (const b of balances) {
+        const secId = strVal(b['EquityNumber']);
+        const qty = Number(b['OnlineNV'] ?? 0);
         if (qty === 0) continue;
+        // Prices are in agorot (1/100 ILS)
+        const price = Number(b['LastRate'] ?? 0) / 100;
+        const avgCost = Number(b['AveragePrice'] ?? 0) / 100;
+        const pnl = Number(b['AveragePriceProfitLoss'] ?? 0);
+        const currency = strVal(b['CurrencyCode'], 'ILS');
+        const name = nameById.get(secId) || secId;
+
         allPositions.push({
           identifier: `psagot-${secId}`,
           name: `${name} (${accountId})`,
@@ -207,7 +205,7 @@ export class PsagotScraper extends BasePortfolioScraper {
           price,
           avgCost,
           unrealizedPnl: pnl,
-          currency: 'ILS',
+          currency,
         });
       }
     }
