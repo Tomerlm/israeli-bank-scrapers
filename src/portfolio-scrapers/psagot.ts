@@ -366,10 +366,15 @@ export class PsagotScraper extends BasePortfolioScraper {
       timeout: 60_000,
     });
 
-    // 6. Handle OTP challenge
-    await page.waitForFunction(() => document.querySelectorAll('input').length > 0, { timeout: 60_000 });
+    // 6. Handle OTP challenge (optional — some sessions skip OTP entirely).
+    // Probe with a short timeout; if no native <input> appears we assume the site
+    // navigated straight to the portfolio (Flutter page, no HTML inputs) and move on.
+    const otpInputAppeared = await page
+      .waitForFunction(() => document.querySelectorAll('input').length > 0, { timeout: 10_000 })
+      .then(() => true)
+      .catch(() => false);
 
-    if (otpCodeRetriever) {
+    if (otpInputAppeared && otpCodeRetriever) {
       const pageState = await page.evaluate(() => ({
         inputs: Array.from(document.querySelectorAll('input')).map(el => el.getAttribute('aria-label')),
       }));
