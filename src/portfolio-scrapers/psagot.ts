@@ -149,6 +149,9 @@ async function extractAccountData(page: Page): Promise<{
 
 // Opens the account switcher dropdown and returns all account IDs.
 async function getAllAccountIds(page: Page): Promise<string[]> {
+  // Wait for Flutter a11y tree to be ready on the portfolio page before clicking
+  await waitForElement(page, 'flt-semantics[role="button"]', 30_000);
+
   await page.evaluate(() => {
     const btn = Array.from(document.querySelectorAll('flt-semantics[role="button"]')).find(el =>
       el.textContent?.includes('Profile menu'),
