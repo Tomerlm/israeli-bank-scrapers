@@ -56,15 +56,30 @@ export class PsagotScraper extends BasePortfolioScraper {
 
     // ── 1. Set up login response interceptor to capture SessionKey ────────────
     let sessionKey = '';
+    // Balances responses intercepted from the Flutter app's own polling — used instead of
+    // explicit apiFetch for accounts the app auto-loads (avoids concurrent-request 401s).
+    const capturedBalances = new Map<string, unknown>();
     page.on('response', response => {
-      if (!response.url().includes('/login')) return;
-      void response
-        .json()
-        .then((body: unknown) => {
-          const key = (body as { Login?: { SessionKey?: string } })?.Login?.SessionKey;
-          if (key) sessionKey = key;
-        })
-        .catch(() => undefined);
+      const url = response.url();
+      if (url.includes('/login')) {
+        void response
+          .json()
+          .then((body: unknown) => {
+            const key = (body as { Login?: { SessionKey?: string } })?.Login?.SessionKey;
+            if (key) sessionKey = key;
+          })
+          .catch(() => undefined);
+        return;
+      }
+      if (url.includes('/account/view/balances')) {
+        const accountMatch = url.match(/account=([^&]+)/);
+        if (accountMatch) {
+          void response
+            .json()
+            .then((body: unknown) => { capturedBalances.set(accountMatch[1], body); })
+            .catch(() => undefined);
+        }
+      }
     });
 
     // ── 2. Boot Flutter ───────────────────────────────────────────────────────
@@ -167,13 +182,41 @@ export class PsagotScraper extends BasePortfolioScraper {
     // ── 7. Fetch balances for each account ────────────────────────────────────
     const allPositions: PortfolioPosition[] = [];
     let totalCashIls = 0;
+    let lastExplicitFetch = 0; // ms timestamp — enforce 1500ms min between explicit apiFetch calls
 
     for (const accountId of accountIds) {
-      const balancesRes = (await apiFetch(
-        page,
-        sessionKey,
-        `${BASE_URL}/V2/json2/account/view/balances?account=${accountId}&fields=hebName&currency=ils&catalog=unified`,
-      )) as {
+      // Wait up to 5s for the Flutter app to auto-populate this account's balances
+      // (it continuously polls primary accounts — intercepting avoids concurrent-request 401s).
+      const captured = await new Promise<unknown>(resolve => {
+        const deadline = Date.now() + 5_000;
+        const check = setInterval(() => {
+          const val = capturedBalances.get(accountId);
+          if (val !== undefined) { clearInterval(check); resolve(val); return; }
+          if (Date.now() > deadline) { clearInterval(check); resolve(undefined); }
+        }, 200);
+      });
+
+      let balancesRes: unknown;
+      if (captured !== undefined) {
+        // eslint-disable-next-line no-console
+        console.log(`[psagot-scraper] using intercepted balances for ${accountId}`);
+        balancesRes = captured;
+      } else {
+        // Not auto-fetched by the app — do an explicit fetch, respecting the 1000ms server rate limit.
+        const now = Date.now();
+        const wait = 1_500 - (now - lastExplicitFetch);
+        if (wait > 0) await new Promise(r => setTimeout(r, wait));
+        // eslint-disable-next-line no-console
+        console.log(`[psagot-scraper] explicit apiFetch balances for ${accountId}`);
+        balancesRes = await apiFetch(
+          page,
+          sessionKey,
+          `${BASE_URL}/V2/json2/account/view/balances?account=${accountId}&fields=hebName&currency=ils&catalog=unified`,
+        );
+        lastExplicitFetch = Date.now();
+      }
+
+      const typedRes = balancesRes as {
         View?: {
           Account?: {
             OnlineCash?: number;
@@ -183,7 +226,7 @@ export class PsagotScraper extends BasePortfolioScraper {
         };
       };
 
-      const account = balancesRes?.View?.Account;
+      const account = typedRes?.View?.Account;
       if (!account) {
         // eslint-disable-next-line no-console
         console.log(`[psagot-scraper] no Account in balances response for ${accountId}`);
@@ -193,7 +236,7 @@ export class PsagotScraper extends BasePortfolioScraper {
       totalCashIls += Number(account.OnlineCash ?? 0);
 
       // Build a map of security ID → name from Meta.Security
-      const rawMeta = balancesRes?.View?.Meta?.Security;
+      const rawMeta = typedRes?.View?.Meta?.Security;
       const metaSecurities = Array.isArray(rawMeta) ? rawMeta : rawMeta ? [rawMeta] : [];
       const nameById = new Map<string, string>(metaSecurities.map(s => [s['-Key'], s.HebName ?? '']));
 
