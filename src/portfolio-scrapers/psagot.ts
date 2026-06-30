@@ -152,17 +152,34 @@ async function getAllAccountIds(page: Page): Promise<string[]> {
   // Wait for Flutter a11y tree to be ready on the portfolio page before clicking
   await waitForElement(page, 'flt-semantics[role="button"]', 30_000);
 
+  const buttonTexts = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('flt-semantics[role="button"]')).map(el => el.textContent?.trim()),
+  );
+  // eslint-disable-next-line no-console
+  console.log('[psagot-scraper] buttons visible on portfolio page:', JSON.stringify(buttonTexts));
+
   await page.evaluate(() => {
     const btn = Array.from(document.querySelectorAll('flt-semantics[role="button"]')).find(el =>
       el.textContent?.includes('Profile menu'),
     ) as HTMLElement | null;
-    btn?.click();
+    // eslint-disable-next-line no-console
+    console.log('[psagot-scraper] profile menu btn found:', btn !== null);
+    if (btn) btn.click();
   });
 
+  // eslint-disable-next-line no-console
+  console.log('[psagot-scraper] waiting for account IDs in dropdown...');
   await page.waitForFunction(
     () => Array.from(document.querySelectorAll('flt-semantics')).some(el => /\d{3}-\d{6}/.test(el.textContent ?? '')),
     { timeout: 10_000 },
-  );
+  ).catch(async (err) => {
+    const allText = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('flt-semantics')).map(el => el.textContent?.trim()).filter(Boolean).slice(0, 50),
+    );
+    // eslint-disable-next-line no-console
+    console.log('[psagot-scraper] flt-semantics text samples (first 50):', JSON.stringify(allText));
+    throw err;
+  });
 
   const ids = await page.evaluate(() =>
     Array.from(document.querySelectorAll('flt-semantics'))
