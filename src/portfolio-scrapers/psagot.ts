@@ -169,41 +169,49 @@ async function dismissWelcomeDialogIfPresent(page: Page): Promise<void> {
   // eslint-disable-next-line no-console
   console.log('[psagot-scraper] welcome dialog detected — stepping through');
 
-  // The dialog may be a multi-step wizard (Next → Next → Skip/Close).
-  // Click whatever dismiss button is available each round until the dialog is gone.
-  const DISMISS_LABELS = ['Skip', 'Next', 'Close', 'Done', 'סגור', 'דלג'];
-  for (let attempt = 0; attempt < 8; attempt++) {
-    const stillOpen = await page.evaluate(() =>
-      Array.from(document.querySelectorAll('flt-semantics')).some(el =>
-        el.textContent?.includes('Welcome to the New Psagot Trade'),
-      ),
-    );
-    if (!stillOpen) break;
+  // The wizard has multiple slides. Prefer Skip/Close (exits wizard) over Next (advances slide).
+  // After clicking Skip, verify by checking Skip is absent — the portfolio page has Next but not Skip.
+  const SKIP_LABELS = ['Skip', 'Close', 'Done', 'סגור', 'דלג'];
 
-    const clicked = await page.evaluate((labels: string[]) => {
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const result = await page.evaluate((skipLabels: string[]) => {
       const buttons = Array.from(document.querySelectorAll('flt-semantics[role="button"]'));
-      const btn = buttons.find(el => labels.includes(el.textContent?.trim() ?? '')) as HTMLElement | null;
-      if (btn) {
-        // eslint-disable-next-line no-console
-        console.log('[psagot-scraper] clicking dialog button:', btn.textContent?.trim());
-        btn.click();
-        return true;
-      }
-      return false;
-    }, DISMISS_LABELS);
 
-    if (!clicked) break;
-    // Give Flutter time to animate to the next dialog page
+      // Prefer Skip/Close/Done — these exit the wizard entirely
+      const skipBtn = buttons.find(el => skipLabels.includes(el.textContent?.trim() ?? '')) as HTMLElement | null;
+      if (skipBtn) {
+        // eslint-disable-next-line no-console
+        console.log('[psagot-scraper] clicking wizard dismiss button:', skipBtn.textContent?.trim());
+        skipBtn.click();
+        return 'skip';
+      }
+
+      // Fall back to Next — advances to the next wizard slide
+      const nextBtn = buttons.find(el => el.textContent?.trim() === 'Next') as HTMLElement | null;
+      if (nextBtn) {
+        // eslint-disable-next-line no-console
+        console.log('[psagot-scraper] clicking wizard next button');
+        nextBtn.click();
+        return 'next';
+      }
+
+      return null;
+    }, SKIP_LABELS);
+
+    if (result === null) break;
+
     await new Promise(r => setTimeout(r, 1_500));
+
+    if (result === 'skip') {
+      // Verify wizard is closed: portfolio page has Next but not Skip
+      const wizardGone = await page.evaluate((skipLabels: string[]) => {
+        const buttons = Array.from(document.querySelectorAll('flt-semantics[role="button"]'));
+        return !buttons.some(el => skipLabels.includes(el.textContent?.trim() ?? ''));
+      }, SKIP_LABELS);
+      if (wizardGone) break;
+    }
   }
 
-  await page.waitForFunction(
-    () =>
-      !Array.from(document.querySelectorAll('flt-semantics')).some(el =>
-        el.textContent?.includes('Welcome to the New Psagot Trade'),
-      ),
-    { timeout: 20_000 },
-  );
   // eslint-disable-next-line no-console
   console.log('[psagot-scraper] welcome dialog dismissed');
 }
