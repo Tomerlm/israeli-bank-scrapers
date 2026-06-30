@@ -11,7 +11,6 @@ const SEL = {
 } as const;
 
 async function waitForElement(page: Page, selector: string, timeout = 60_000): Promise<void> {
-  // waitForFunction avoids visibility checks that fail on Flutter's 1×1 px elements
   await page.waitForFunction((sel: string) => document.querySelector(sel) !== null, { timeout }, selector);
 }
 
@@ -23,13 +22,6 @@ async function enableA11y(page: Page): Promise<void> {
   });
 }
 
-async function flutterClick(page: Page, selector: string): Promise<void> {
-  await page.evaluate((sel: string) => {
-    const el = document.querySelector(sel);
-    if (el instanceof HTMLElement) el.click();
-  }, selector);
-}
-
 async function flutterClickByText(page: Page, text: string): Promise<void> {
   await page.evaluate((t: string) => {
     const el = Array.from(document.querySelectorAll('flt-semantics[role="button"]')).find(
@@ -39,304 +31,25 @@ async function flutterClickByText(page: Page, text: string): Promise<void> {
   }, text);
 }
 
-// Extracts positions and cash from the currently active account.
-// DOM patterns (Flutter a11y mode):
-//   Position name + qty:  flt-semantics[role="img"][aria-label^="Position:"]
-//     label = "Position: \nCompany logo\n{name}\nQuantity\n {qty} "
-//   Financial data: leaf flt-semantics (no flt-semantics children), in row order:
-//     "Last rate: \n{price}Agorot\n{+/-}%"   (price in Agorot → divide by 100 for ILS)
-//     "Daily profit loss: \n {amount} Israeli Shekel"
-//     "Total Profit Loss: \n {amount} Israeli Shekel\n{Plus|Minus} {pct}%"
-//     "Total value: \n {amount} Israeli Shekel"
-//     "Actions menu"
-//   Cash: flt-semantics[role="img"][aria-label^="ILS\n"]
-async function extractAccountData(page: Page): Promise<{
-  accountId: string;
-  positions: PortfolioPosition[];
-  cash: PortfolioCash[];
-}> {
-  await page.waitForFunction(() => document.querySelectorAll('flt-semantics[role="img"]').length > 0, {
-    timeout: 60_000,
-  });
-
-  // Comprehensive DOM dump for diagnosing position extraction
-  const debugInfo = await page.evaluate(() => {
-    const allLeaves = Array.from(document.querySelectorAll('flt-semantics'))
-      .filter(el => !el.querySelector('flt-semantics') && el.textContent?.trim())
-      .map(el => el.textContent?.trim() ?? '')
-      .filter(Boolean);
-    const allRoles = Array.from(document.querySelectorAll('flt-semantics[role]'))
-      .map(el => `${el.getAttribute('role')}|${(el.getAttribute('aria-label') ?? el.textContent ?? '').slice(0, 120)}`)
-      .filter(Boolean);
-    const groupEls = Array.from(document.querySelectorAll('flt-semantics[role="group"]')).map(el =>
-      el.textContent?.trim()?.slice(0, 200),
-    );
-    return { allLeaves, allRoles, groupEls };
-  });
-  // eslint-disable-next-line no-console
-  console.log('[psagot-scraper] all leaves:', JSON.stringify(debugInfo.allLeaves));
-  // eslint-disable-next-line no-console
-  console.log('[psagot-scraper] all roles:', JSON.stringify(debugInfo.allRoles));
-  // eslint-disable-next-line no-console
-  console.log('[psagot-scraper] groups:', JSON.stringify(debugInfo.groupEls));
-
-  return page.evaluate(() => {
-    // Current account ID from the profile menu button text ("Profile menu\n150-259840")
-    const profileBtn = Array.from(document.querySelectorAll('flt-semantics[role="button"]')).find(el =>
-      el.textContent?.includes('Profile menu'),
-    );
-    const accountId =
-      profileBtn?.textContent
-        ?.split('\n')
-        .find(s => /^\d{3}-\d+$/.test(s.trim()))
-        ?.trim() ?? '';
-
-    // Position name + quantity from aria-label on role="img" elements
-    const posImgs = Array.from(document.querySelectorAll<Element>('flt-semantics[role="img"]')).filter(el =>
-      el.getAttribute('aria-label')?.startsWith('Position:'),
-    );
-
-    const positionInfos = posImgs.map(el => {
-      const label = el.getAttribute('aria-label') ?? '';
-      // "Position: \nCompany logo\nISH.FRF SP 500\nQuantity\n 6 "
-      const nameMatch = label.match(/Company logo\n(.+?)\nQuantity/s);
-      const qtyMatch = label.match(/Quantity\n\s*([\d.,]+)/);
-      return {
-        name: nameMatch?.[1]?.trim() ?? '',
-        quantity: parseFloat((qtyMatch?.[1] ?? '0').replace(/,/g, '')),
-      };
-    });
-
-    // Financial data rows from leaf nodes (nodes with no flt-semantics children)
-    const leaves = Array.from(document.querySelectorAll('flt-semantics'))
-      .filter(el => !el.querySelector('flt-semantics') && el.textContent?.trim())
-      .map(el => el.textContent?.trim() ?? '');
-
-    const financialRows: Array<{ priceAgorot: number; totalPnl: number; totalValue: number }> = [];
-
-    for (let i = 0; i < leaves.length; i++) {
-      const leaf = leaves[i];
-      if (!leaf?.startsWith('Last rate: ')) continue;
-
-      // Price in Agorot (100 Agorot = 1 ILS)
-      const priceMatch = leaf.match(/([\d.]+)Agorot/);
-      const priceAgorot = parseFloat(priceMatch?.[1] ?? '0');
-
-      i++; // skip "Daily profit loss: ..."
-      i++; // move to "Total Profit Loss: ..."
-
-      const pnlLeaf = leaves[i] ?? '';
-      const pnlSign = pnlLeaf.includes('Minus') ? -1 : 1;
-      const pnlMatch = pnlLeaf.match(/([\d.,]+) Israeli Shekel/);
-      const totalPnl = pnlSign * parseFloat((pnlMatch?.[1] ?? '0').replace(/,/g, ''));
-
-      i++; // move to "Total value: ..."
-
-      const valueLeaf = leaves[i] ?? '';
-      const valueMatch = valueLeaf.match(/([\d.,]+) Israeli Shekel/);
-      const totalValue = parseFloat((valueMatch?.[1] ?? '0').replace(/,/g, ''));
-
-      financialRows.push({ priceAgorot, totalPnl, totalValue });
-    }
-
-    // Cash balance from ILS img label ("ILS\n 818 Israeli Shekel")
-    const cashImg = Array.from(document.querySelectorAll('flt-semantics[role="img"]')).find(el =>
-      el.getAttribute('aria-label')?.startsWith('ILS\n'),
-    );
-    const cashLabel = cashImg?.getAttribute('aria-label') ?? '';
-    const cashMatch = cashLabel.match(/([\d.,]+) Israeli Shekel/);
-    const cashIls = parseFloat((cashMatch?.[1] ?? '0').replace(/,/g, ''));
-
-    const positions: PortfolioPosition[] = positionInfos.map((pos, idx) => {
-      const fin = financialRows[idx] ?? { priceAgorot: 0, totalPnl: 0, totalValue: 0 };
-      const priceIls = fin.priceAgorot / 100;
-      const avgCostIls = pos.quantity > 0 ? (fin.totalValue - fin.totalPnl) / pos.quantity : 0;
-      return {
-        identifier: `psagot-${accountId}-${pos.name.replace(/[^A-Za-z0-9]/g, '_')}`,
-        name: `${pos.name} (${accountId})`,
-        quantity: pos.quantity,
-        price: priceIls,
-        avgCost: avgCostIls,
-        unrealizedPnl: fin.totalPnl,
-        currency: 'ILS',
-      };
-    });
-
-    const cash: PortfolioCash[] = cashIls > 0 ? [{ currency: 'ILS', amount: cashIls }] : [];
-
-    return { accountId, positions, cash };
-  });
-}
-
-// Dismisses the "Welcome to the New Psagot Trade" onboarding overlay if present.
-// Waits for the page to settle into either the welcome dialog or the portfolio view before deciding.
-async function dismissWelcomeDialogIfPresent(page: Page): Promise<void> {
-  // Wait until Flutter renders either the welcome dialog OR the profile menu button
-  await page.waitForFunction(
-    () =>
-      Array.from(document.querySelectorAll('flt-semantics')).some(
-        el => el.textContent?.includes('Welcome to the New Psagot Trade') || el.textContent?.includes('Profile menu'),
-      ),
-    { timeout: 30_000 },
-  );
-
-  const hasDialog = await page.evaluate(() =>
-    Array.from(document.querySelectorAll('flt-semantics')).some(el =>
-      el.textContent?.includes('Welcome to the New Psagot Trade'),
-    ),
-  );
-  if (!hasDialog) return;
-
-  // eslint-disable-next-line no-console
-  console.log('[psagot-scraper] welcome dialog detected — stepping through');
-
-  // The wizard has multiple slides. Prefer Skip/Close (exits wizard) over Next (advances slide).
-  // After clicking Skip, verify by checking Skip is absent — the portfolio page has Next but not Skip.
-  const SKIP_LABELS = ['Skip', 'Close', 'Done', 'סגור', 'דלג'];
-
-  for (let attempt = 0; attempt < 12; attempt++) {
-    const result = await page.evaluate((skipLabels: string[]) => {
-      const buttons = Array.from(document.querySelectorAll('flt-semantics[role="button"]'));
-
-      // Prefer Skip/Close/Done — these exit the wizard entirely
-      const skipBtn = buttons.find(el => skipLabels.includes(el.textContent?.trim() ?? '')) as HTMLElement | null;
-      if (skipBtn) {
-        // eslint-disable-next-line no-console
-        console.log('[psagot-scraper] clicking wizard dismiss button:', skipBtn.textContent?.trim());
-        skipBtn.click();
-        return 'skip';
-      }
-
-      // Fall back to Next — advances to the next wizard slide
-      const nextBtn = buttons.find(el => el.textContent?.trim() === 'Next') as HTMLElement | null;
-      if (nextBtn) {
-        // eslint-disable-next-line no-console
-        console.log('[psagot-scraper] clicking wizard next button');
-        nextBtn.click();
-        return 'next';
-      }
-
-      return null;
-    }, SKIP_LABELS);
-
-    if (result === null) break;
-
-    await new Promise(r => setTimeout(r, 1_500));
-
-    if (result === 'skip') {
-      // Verify wizard is closed: portfolio page has Next but not Skip
-      const wizardGone = await page.evaluate((skipLabels: string[]) => {
-        const buttons = Array.from(document.querySelectorAll('flt-semantics[role="button"]'));
-        return !buttons.some(el => skipLabels.includes(el.textContent?.trim() ?? ''));
-      }, SKIP_LABELS);
-      if (wizardGone) break;
+// Heuristic: does this JSON body look like a portfolio holdings response?
+// We look for an array of objects that each have a numeric quantity field.
+function looksLikeHoldings(body: unknown): boolean {
+  const candidates = [
+    body,
+    ...(typeof body === 'object' && body !== null ? Object.values(body as Record<string, unknown>) : []),
+  ];
+  for (const candidate of candidates) {
+    if (!Array.isArray(candidate) || candidate.length === 0) continue;
+    const first = candidate[0] as Record<string, unknown>;
+    if (
+      typeof first === 'object' &&
+      first !== null &&
+      Object.keys(first).some(k => /qty|quantity|amount|units|shares/i.test(k))
+    ) {
+      return true;
     }
   }
-
-  // eslint-disable-next-line no-console
-  console.log('[psagot-scraper] welcome dialog dismissed');
-}
-
-// Opens the account switcher dropdown and returns all account IDs.
-async function getAllAccountIds(page: Page): Promise<string[]> {
-  // Wait for Flutter a11y tree to be ready on the portfolio page before clicking
-  await waitForElement(page, 'flt-semantics[role="button"]', 30_000);
-
-  const buttonTexts = await page.evaluate(() =>
-    Array.from(document.querySelectorAll('flt-semantics[role="button"]')).map(el => el.textContent?.trim()),
-  );
-  // eslint-disable-next-line no-console
-  console.log('[psagot-scraper] buttons visible on portfolio page:', JSON.stringify(buttonTexts));
-
-  await page.evaluate(() => {
-    const btn = Array.from(document.querySelectorAll('flt-semantics[role="button"]')).find(el =>
-      el.textContent?.includes('Profile menu'),
-    ) as HTMLElement | null;
-    // eslint-disable-next-line no-console
-    console.log('[psagot-scraper] profile menu btn found:', btn !== null);
-    if (btn) btn.click();
-  });
-
-  // eslint-disable-next-line no-console
-  console.log('[psagot-scraper] waiting for account IDs in dropdown...');
-  await page
-    .waitForFunction(
-      () => Array.from(document.querySelectorAll('flt-semantics')).some(el => /\d{3}-\d{6}/.test(el.textContent ?? '')),
-      { timeout: 10_000 },
-    )
-    .catch(async err => {
-      const allText = await page.evaluate(() =>
-        Array.from(document.querySelectorAll('flt-semantics'))
-          .map(el => el.textContent?.trim())
-          .filter(Boolean)
-          .slice(0, 50),
-      );
-      // eslint-disable-next-line no-console
-      console.log('[psagot-scraper] flt-semantics text samples (first 50):', JSON.stringify(allText));
-      throw err;
-    });
-
-  const ids = await page.evaluate(() =>
-    Array.from(document.querySelectorAll('flt-semantics'))
-      .map(el => el.textContent?.match(/(\d{3}-\d{6})/)?.[1])
-      .filter((t): t is string => !!t),
-  );
-
-  await page.keyboard.press('Escape');
-  await new Promise(r => setTimeout(r, 500));
-
-  return [...new Set(ids)];
-}
-
-// Switches the active account to targetAccountId via the Flutter account dropdown.
-async function switchAccount(page: Page, targetAccountId: string): Promise<void> {
-  await page.evaluate(() => {
-    const btn = Array.from(document.querySelectorAll('flt-semantics[role="button"]')).find(el =>
-      el.textContent?.includes('Profile menu'),
-    ) as HTMLElement | null;
-    btn?.click();
-  });
-
-  await page.waitForFunction(
-    (id: string) => Array.from(document.querySelectorAll('flt-semantics')).some(el => el.textContent?.includes(id)),
-    { timeout: 10_000 },
-    targetAccountId,
-  );
-
-  await page.evaluate((id: string) => {
-    // Prefer role="button" elements (actual clickable items in the dropdown).
-    // Fall back to the deepest flt-semantics element containing the id (last in DOM order = deepest).
-    const buttons = Array.from(document.querySelectorAll('flt-semantics[role="button"]'));
-    const btn = buttons.find(el => el.textContent?.includes(id)) as HTMLElement | null;
-    if (btn) {
-      // eslint-disable-next-line no-console
-      console.log('[psagot-scraper] switching account via button:', btn.textContent?.trim().slice(0, 80));
-      btn.click();
-      return;
-    }
-    const all = Array.from(document.querySelectorAll('flt-semantics')).filter(el =>
-      (el.textContent ?? '').includes(id),
-    );
-    const el = all[all.length - 1] as HTMLElement | null;
-    // eslint-disable-next-line no-console
-    console.log('[psagot-scraper] switching account via fallback element:', el?.textContent?.trim().slice(0, 80));
-    el?.click();
-  }, targetAccountId);
-
-  // Wait for the profile menu button to reflect the new account
-  await page.waitForFunction(
-    (id: string) => {
-      const btn = Array.from(document.querySelectorAll('flt-semantics[role="button"]')).find(el =>
-        el.textContent?.includes('Profile menu'),
-      );
-      return btn?.textContent?.includes(id) === true;
-    },
-    { timeout: 30_000 },
-    targetAccountId,
-  );
-
-  // Give Flutter time to re-render the portfolio after the account switch
-  await new Promise(r => setTimeout(r, 3_000));
+  return false;
 }
 
 export class PsagotScraper extends BasePortfolioScraper {
@@ -348,7 +61,7 @@ export class PsagotScraper extends BasePortfolioScraper {
     const password = typeof credentials['password'] === 'string' ? credentials['password'] : '';
     const otpCodeRetriever = credentials['otpCodeRetriever'] as (() => Promise<string>) | undefined;
 
-    // Intercept JSON API responses to discover portfolio data endpoints
+    // Capture all JSON API responses made by the Flutter app after login.
     const capturedApis: Array<{ url: string; body: unknown }> = [];
     page.on('response', response => {
       const ct = response.headers()['content-type'] ?? '';
@@ -359,7 +72,7 @@ export class PsagotScraper extends BasePortfolioScraper {
         .catch(() => undefined);
     });
 
-    // 1. Navigate and wait for Flutter WASM to boot
+    // ── 1. Boot Flutter ──────────────────────────────────────────────────────────
     await page.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     );
@@ -368,20 +81,20 @@ export class PsagotScraper extends BasePortfolioScraper {
     // eslint-disable-next-line no-console
     console.log('[psagot-scraper] Flutter initialized');
 
-    // 2. Enable Flutter accessibility and fill credentials
+    // ── 2. Login ─────────────────────────────────────────────────────────────────
     await enableA11y(page);
     await waitForElement(page, SEL.username, 30_000);
     await page.type(SEL.username, username);
     await page.type(SEL.password, password);
 
-    // 3. Check terms checkbox (required before Login button enables)
-    await flutterClick(page, SEL.termsCheckbox);
+    await page.evaluate(() => {
+      const cb = document.querySelector('flt-semantics[role="checkbox"]');
+      if (cb instanceof HTMLElement) cb.click();
+    });
     await page.waitForFunction(
       () => document.querySelector('flt-semantics[role="checkbox"]')?.getAttribute('aria-checked') === 'true',
       { timeout: 10_000 },
     );
-
-    // 4. Wait for Login button to enable, then click
     await page.waitForFunction(
       () => {
         const btn = Array.from(document.querySelectorAll('flt-semantics[role="button"]')).find(
@@ -392,26 +105,24 @@ export class PsagotScraper extends BasePortfolioScraper {
       { timeout: 30_000 },
     );
     await flutterClickByText(page, 'Login');
-
-    // 5. Wait for login form to disappear
     await page.waitForFunction(() => !document.querySelector('input[aria-label="Username required"]'), {
       timeout: 60_000,
     });
 
-    // 6. Handle OTP challenge (optional — some sessions skip OTP entirely).
-    // Probe with a short timeout; if no native <input> appears we assume the site
-    // navigated straight to the portfolio (Flutter page, no HTML inputs) and move on.
+    // ── 3. OTP (optional) ────────────────────────────────────────────────────────
     const otpInputAppeared = await page
       .waitForFunction(() => document.querySelectorAll('input').length > 0, { timeout: 10_000 })
       .then(() => true)
       .catch(() => false);
 
     if (otpInputAppeared && otpCodeRetriever) {
-      const pageState = await page.evaluate(() => ({
-        inputs: Array.from(document.querySelectorAll('input')).map(el => el.getAttribute('aria-label')),
-      }));
-      const otpAriaLabel = pageState.inputs[0] ?? '';
+      const inputs = await page.evaluate(() =>
+        Array.from(document.querySelectorAll('input')).map(el => el.getAttribute('aria-label')),
+      );
+      const otpAriaLabel = inputs[0] ?? '';
       if (otpAriaLabel) {
+        // eslint-disable-next-line no-console
+        console.log('[psagot-scraper] OTP required');
         const code = await otpCodeRetriever();
         await page.type(`input[aria-label="${otpAriaLabel}"]`, code);
         await page.waitForFunction(
@@ -427,49 +138,107 @@ export class PsagotScraper extends BasePortfolioScraper {
       }
     }
 
-    // 7. Wait for navigation away from login
+    // ── 4. Wait for portfolio page + let API calls settle ────────────────────────
     await page.waitForFunction(() => !location.href.includes('/login') && !location.href.endsWith('/'), {
       timeout: 60_000,
     });
     // eslint-disable-next-line no-console
     console.log('[psagot-scraper] navigated to:', await page.evaluate(() => location.href));
 
-    // 8. Dismiss onboarding overlay if shown, then collect accounts.
-    await dismissWelcomeDialogIfPresent(page);
-    // Give extra time for background API calls to complete
-    await new Promise(r => setTimeout(r, 2_000));
+    // Give the Flutter app time to load portfolio data from its backend APIs
+    await new Promise(r => setTimeout(r, 4_000));
+
+    // ── 5. Extract data from captured API responses ───────────────────────────────
     // eslint-disable-next-line no-console
-    console.log('[psagot-scraper] captured API calls:', capturedApis.length);
+    console.log('[psagot-scraper] captured API responses:', capturedApis.length);
     for (const api of capturedApis) {
       // eslint-disable-next-line no-console
-      console.log(`[psagot-scraper] API: ${api.url}`);
-      // eslint-disable-next-line no-console
-      console.log(`[psagot-scraper] API body: ${JSON.stringify(api.body).slice(0, 400)}`);
-    }
-    const accountIds = await getAllAccountIds(page);
-    // eslint-disable-next-line no-console
-    console.log('[psagot-scraper] accounts found:', accountIds);
-
-    const firstData = await extractAccountData(page);
-    // eslint-disable-next-line no-console
-    console.log(`[psagot-scraper] account ${firstData.accountId}: ${firstData.positions.length} positions`);
-    const allData = [firstData];
-
-    for (const accountId of accountIds) {
-      if (accountId === firstData.accountId) continue;
-      await switchAccount(page, accountId);
-      const data = await extractAccountData(page);
-      // eslint-disable-next-line no-console
-      console.log(`[psagot-scraper] account ${data.accountId}: ${data.positions.length} positions`);
-      allData.push(data);
+      console.log(`[psagot-scraper] API ${api.url} → ${JSON.stringify(api.body).slice(0, 300)}`);
     }
 
-    // 9. Combine positions and cash across all accounts
-    const positions: PortfolioPosition[] = allData.flatMap(d => d.positions);
-    const totalIlsCash = allData.flatMap(d => d.cash).reduce((sum, c) => sum + c.amount, 0);
-    const cash: PortfolioCash[] = totalIlsCash > 0 ? [{ currency: 'ILS', amount: totalIlsCash }] : [];
+    // Find the holdings response: an array of objects with quantity-like fields.
+    const holdingsApi = capturedApis.find(r => looksLikeHoldings(r.body));
+    if (!holdingsApi) {
+      // Log all response URLs so we can identify the right one manually
+      const urls = capturedApis.map(r => r.url).join('\n  ');
+      throw new Error(
+        `[psagot-scraper] Could not detect portfolio holdings in captured API responses.\nCaptured URLs:\n  ${urls}`,
+      );
+    }
 
+    // eslint-disable-next-line no-console
+    console.log('[psagot-scraper] holdings API:', holdingsApi.url);
+    // eslint-disable-next-line no-console
+    console.log('[psagot-scraper] holdings body:', JSON.stringify(holdingsApi.body).slice(0, 600));
+
+    // ── 6. Map holdings → PortfolioPosition[] ────────────────────────────────────
+    // Extract the array from the response (handles both top-level array and wrapped {data:[...]})
+    const rawRows: Record<string, unknown>[] = (() => {
+      const body = holdingsApi.body;
+      if (Array.isArray(body)) return body as Record<string, unknown>[];
+      if (typeof body === 'object' && body !== null) {
+        for (const v of Object.values(body as Record<string, unknown>)) {
+          if (Array.isArray(v)) return v as Record<string, unknown>[];
+        }
+      }
+      return [];
+    })();
+
+    // eslint-disable-next-line no-console
+    console.log('[psagot-scraper] position rows:', rawRows.length);
+    if (rawRows.length > 0) {
+      // eslint-disable-next-line no-console
+      console.log('[psagot-scraper] first row keys:', Object.keys(rawRows[0] ?? {}).join(', '));
+    }
+
+    function strField(row: Record<string, unknown>, ...keys: string[]): string {
+      for (const k of keys) {
+        const v = row[k];
+        if (typeof v === 'string') return v;
+        if (typeof v === 'number') return String(v);
+      }
+      return '';
+    }
+    const positions: PortfolioPosition[] = rawRows
+      .map(row => {
+        // Field names are discovered from the first log run — update these after seeing the actual keys.
+        const secId = strField(row, 'securityId', 'SecurityId', 'security_id', 'EquityNum', 'id');
+        const name = strField(row, 'name', 'Name', 'HebName', 'EngName') || secId;
+        const qty = Number(row['quantity'] ?? row['Quantity'] ?? row['qty'] ?? row['units'] ?? row['amount'] ?? 0);
+        const price = Number(row['price'] ?? row['Price'] ?? row['LastRate'] ?? row['lastRate'] ?? row['rate'] ?? 0);
+        const avgCost = Number(row['avgCost'] ?? row['AvgCost'] ?? row['avg_cost'] ?? row['avgRate'] ?? 0);
+        const pnl = Number(row['unrealizedPnl'] ?? row['UnrealizedPnl'] ?? row['profitLoss'] ?? row['ProfitLoss'] ?? 0);
+        const currency = strField(row, 'currency', 'Currency', 'CurrencyCode') || 'ILS';
+        return { secId, name, qty, price, avgCost, pnl, currency };
+      })
+      .filter(r => r.qty !== 0)
+      .map(r => ({
+        identifier: `psagot-${r.secId}`,
+        name: r.name,
+        quantity: r.qty,
+        price: r.price,
+        avgCost: r.avgCost,
+        unrealizedPnl: r.pnl,
+        currency: r.currency as 'ILS' | 'USD',
+      }));
+
+    // ── 7. Cash: look for a response containing cash/balance data ─────────────────
+    let cashIls = 0;
+    const cashApi = capturedApis.find(r => {
+      const s = JSON.stringify(r.body).toLowerCase();
+      return s.includes('cash') || s.includes('buyingpower') || s.includes('buying_power');
+    });
+    if (cashApi) {
+      const s = JSON.stringify(cashApi.body);
+      const m = s.match(/"(?:cash|buyingPower|BuyingPower|buying_power)"\s*:\s*([\d.]+)/);
+      if (m) cashIls = parseFloat(m[1]);
+    }
+
+    const cash: PortfolioCash[] = cashIls > 0 ? [{ currency: 'ILS', amount: cashIls }] : [];
     const asOfDate = new Date().toISOString().slice(0, 10);
+
+    // eslint-disable-next-line no-console
+    console.log(`[psagot-scraper] done — ${positions.length} positions, cash ${cashIls} ILS`);
     return { positions, cash, asOfDate };
   }
 }
