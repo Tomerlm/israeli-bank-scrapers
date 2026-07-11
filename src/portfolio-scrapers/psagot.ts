@@ -31,18 +31,50 @@ function strVal(v: unknown, fallback = ''): string {
   return fallback;
 }
 
-async function apiFetch(page: Page, sessionKey: string, url: string): Promise<unknown> {
-  return page.evaluate(
-    async (targetUrl: string, key: string) => {
-      const res = await fetch(targetUrl, {
-        headers: { session: key, csession: String(Math.random()) },
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status} from ${targetUrl}`);
-      return res.json();
+// The API returns HTTP 200/401/500 with an {"Exception": ...} JSON body on failure —
+// e.g. InvalidSessionException when the csession header doesn't match the one the app
+// used at login, or MinIntervalException when the same endpoint is hit within 1000ms.
+async function apiFetch(page: Page, sessionKey: string, csession: string, url: string): Promise<unknown> {
+  const raw = (await page.evaluate(
+    async (targetUrl: string, key: string, cs: string) => {
+      const res = await fetch(targetUrl, { headers: { session: key, csession: cs } });
+      return { status: res.status, text: await res.text() };
     },
     url,
     sessionKey,
-  );
+    csession,
+  )) as { status: number; text: string };
+
+  let body: unknown;
+  try {
+    body = JSON.parse(raw.text);
+  } catch {
+    throw new Error(`Psagot API non-JSON response (HTTP ${raw.status}) from ${url}: ${raw.text.slice(0, 200)}`);
+  }
+  const exception = (body as { Exception?: { '-ExceptionType'?: string; Message?: string } })?.Exception;
+  if (exception) {
+    throw new Error(`Psagot API ${exception['-ExceptionType'] ?? 'Exception'} from ${url}: ${exception.Message ?? ''}`);
+  }
+  if (raw.status < 200 || raw.status >= 300) throw new Error(`HTTP ${raw.status} from ${url}`);
+  return body;
+}
+
+// The Flutter app polls some endpoints itself; an explicit fetch can collide with its
+// polling and get MinIntervalException — back off and retry instead of failing the scan.
+async function apiFetchWithRetry(page: Page, sessionKey: string, csession: string, url: string): Promise<unknown> {
+  const maxAttempts = 3;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await apiFetch(page, sessionKey, csession, url);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (attempt < maxAttempts && msg.includes('MinIntervalException')) {
+        await new Promise(r => setTimeout(r, 1_600));
+        continue;
+      }
+      throw err;
+    }
+  }
 }
 
 export class PsagotScraper extends BasePortfolioScraper {
@@ -54,11 +86,28 @@ export class PsagotScraper extends BasePortfolioScraper {
     const password = typeof credentials['password'] === 'string' ? credentials['password'] : '';
     const otpCodeRetriever = credentials['otpCodeRetriever'] as (() => Promise<string>) | undefined;
 
-    // ── 1. Set up login response interceptor to capture SessionKey ────────────
+    // ── 1. Interceptors: SessionKey, csession, and the app's own API responses ─
     let sessionKey = '';
+    // The API binds the SessionKey to the csession value the Flutter app generated at
+    // login. Explicit fetches with any other csession get InvalidSessionException, so
+    // capture the app's value from its own authenticated requests.
+    let appSessionKey = '';
+    let appCsession = '';
+    let capturedAccounts: unknown;
     // Balances responses intercepted from the Flutter app's own polling — used instead of
     // explicit apiFetch for accounts the app auto-loads (avoids concurrent-request 401s).
     const capturedBalances = new Map<string, unknown>();
+
+    page.on('request', request => {
+      const url = request.url();
+      if (!url.includes('trade1.psagot.co.il')) return;
+      const headers = request.headers();
+      const sk = headers['session'];
+      const cs = headers['csession'];
+      if (sk && !appSessionKey) appSessionKey = sk;
+      if (cs && !appCsession) appCsession = cs;
+    });
+
     page.on('response', response => {
       const url = response.url();
       if (url.includes('/login')) {
@@ -67,6 +116,15 @@ export class PsagotScraper extends BasePortfolioScraper {
           .then((body: unknown) => {
             const key = (body as { Login?: { SessionKey?: string } })?.Login?.SessionKey;
             if (key) sessionKey = key;
+          })
+          .catch(() => undefined);
+        return;
+      }
+      if (url.includes('/V2/json/accounts')) {
+        void response
+          .json()
+          .then((body: unknown) => {
+            if ((body as { UserAccounts?: unknown })?.UserAccounts) capturedAccounts = body;
           })
           .catch(() => undefined);
         return;
@@ -159,25 +217,56 @@ export class PsagotScraper extends BasePortfolioScraper {
     await new Promise<void>((resolve, reject) => {
       const deadline = Date.now() + 60_000;
       const check = setInterval(() => {
-        if (sessionKey) { clearInterval(check); resolve(); return; }
+        if (sessionKey || appSessionKey) { clearInterval(check); resolve(); return; }
         if (Date.now() > deadline) { clearInterval(check); reject(new Error('Login timed out: no SessionKey received')); }
       }, 500);
     });
     // eslint-disable-next-line no-console
-    console.log('[psagot-scraper] logged in, sessionKey captured:', sessionKey ? 'yes' : 'NO');
+    console.log('[psagot-scraper] logged in, sessionKey captured:', sessionKey || appSessionKey ? 'yes' : 'NO');
 
-    if (!sessionKey) throw new Error('Psagot login succeeded but SessionKey was not captured from response');
+    // Wait for the app's first authenticated request (carries the csession the server
+    // bound at login) — ideally its own accounts response arrives in the same window.
+    await new Promise<void>(resolve => {
+      const deadline = Date.now() + 15_000;
+      const check = setInterval(() => {
+        if (capturedAccounts !== undefined || appCsession || Date.now() > deadline) {
+          clearInterval(check);
+          resolve();
+        }
+      }, 250);
+    });
+    const effectiveKey = sessionKey || appSessionKey;
+    const csession = appCsession || String(Math.random());
+    // eslint-disable-next-line no-console
+    console.log('[psagot-scraper] csession captured:', appCsession ? 'yes' : 'NO (fallback random — API calls will likely fail)');
 
-    // ── 6. Fetch accounts ─────────────────────────────────────────────────────
-    const accountsRes = (await apiFetch(page, sessionKey, `${BASE_URL}/V2/json/accounts?catalog=unified`)) as {
+    if (!effectiveKey) throw new Error('Psagot login succeeded but SessionKey was not captured from response');
+
+    // ── 6. Fetch accounts (prefer the app's own response, intercepted above) ──
+    let accountsRes: {
       UserAccounts?: { UserAccount?: Array<{ '-key': string }> | { '-key': string } };
     };
+    if (capturedAccounts !== undefined) {
+      // eslint-disable-next-line no-console
+      console.log('[psagot-scraper] using intercepted accounts response');
+      accountsRes = capturedAccounts as typeof accountsRes;
+    } else {
+      accountsRes = (await apiFetchWithRetry(
+        page,
+        effectiveKey,
+        csession,
+        `${BASE_URL}/V2/json/accounts?catalog=unified`,
+      )) as typeof accountsRes;
+    }
     const rawAccounts = accountsRes?.UserAccounts?.UserAccount;
     const accountIds = (Array.isArray(rawAccounts) ? rawAccounts : rawAccounts ? [rawAccounts] : []).map(
       a => a['-key'],
     );
     // eslint-disable-next-line no-console
     console.log('[psagot-scraper] accounts:', accountIds);
+    if (accountIds.length === 0) {
+      throw new Error(`Psagot returned no accounts — raw: ${JSON.stringify(accountsRes).slice(0, 300)}`);
+    }
 
     // ── 7. Fetch balances for each account ────────────────────────────────────
     const allPositions: PortfolioPosition[] = [];
@@ -208,9 +297,10 @@ export class PsagotScraper extends BasePortfolioScraper {
         if (wait > 0) await new Promise(r => setTimeout(r, wait));
         // eslint-disable-next-line no-console
         console.log(`[psagot-scraper] explicit apiFetch balances for ${accountId}`);
-        balancesRes = await apiFetch(
+        balancesRes = await apiFetchWithRetry(
           page,
-          sessionKey,
+          effectiveKey,
+          csession,
           `${BASE_URL}/V2/json2/account/view/balances?account=${accountId}&fields=hebName&currency=ils&catalog=unified`,
         );
         lastExplicitFetch = Date.now();

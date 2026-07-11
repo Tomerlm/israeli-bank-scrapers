@@ -51,6 +51,14 @@ function makeMockPage(): MockPage {
           json: () => Promise.resolve({ Login: { SessionKey: MOCK_SESSION_KEY } }),
         });
       }
+      if (event === 'request') {
+        // Simulate the app's first authenticated request — carries the csession
+        // value the server bound to the SessionKey at login.
+        handler({
+          url: () => 'https://trade1.psagot.co.il/v2/json2/charge/clicks',
+          headers: () => ({ session: MOCK_SESSION_KEY, csession: '0.123456789' }),
+        });
+      }
     }),
     setUserAgent: jest.fn().mockResolvedValue(null),
     goto: jest.fn().mockResolvedValue(null),
@@ -58,8 +66,11 @@ function makeMockPage(): MockPage {
     type: jest.fn().mockResolvedValue(null),
     evaluate: jest.fn().mockImplementation(async (_fn: unknown, ...args: unknown[]) => {
       const firstArg = args[0] as string | undefined;
-      if (typeof firstArg === 'string' && firstArg.includes('accounts')) return MOCK_ACCOUNTS_RESPONSE;
-      if (typeof firstArg === 'string' && firstArg.includes('balances')) return MOCK_BALANCES_RESPONSE;
+      // apiFetch runs fetch inside the page and returns { status, text }
+      if (typeof firstArg === 'string' && firstArg.includes('accounts'))
+        return { status: 200, text: JSON.stringify(MOCK_ACCOUNTS_RESPONSE) };
+      if (typeof firstArg === 'string' && firstArg.includes('balances'))
+        return { status: 200, text: JSON.stringify(MOCK_BALANCES_RESPONSE) };
       // DOM calls (no URL arg): return a mock aria-label array so OTP flow can proceed
       if (typeof _fn === 'function' && args.length === 0) {
         return ['Mock OTP Label'];
