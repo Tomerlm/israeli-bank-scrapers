@@ -7,6 +7,9 @@ const LOGIN_URL = `${BASE_URL}/MatafLoginService/MatafLoginServlet?bankId=FIBIPO
 // Classic ("old capital market") securities portfolio page. Rendered by a WebSphere
 // portlet whose holdings DataTable (#table322) is populated client-side by its own JS.
 const PORTFOLIO_URL = `${BASE_URL}/wps/myportal/FibiMenu/Online/OnCapitalMarket/OnMyportfolio/NewPortfolio`;
+// Classic account-balance/transactions view. Its `.main_balance` element holds the current
+// עו"ש balance (same selector the transactions scraper reads in base-beinleumi-group.ts).
+const BALANCE_URL = `${BASE_URL}/wps/myportal/FibiMenu/Online/OnAccountMngment/OnBalanceTrans/PrivateAccountFlow`;
 
 // Same login selectors as scrapers/base-beinleumi-group.ts (the transactions scraper).
 const OTP_SEND_SMS_SELECTOR = '#sendSms';
@@ -43,11 +46,11 @@ export class BeinleumiPortfolioScraper extends BasePortfolioScraper {
 
     await this.login(page, username, password, otpCodeRetriever);
     const { positions, asOfDate } = await this.extractPortfolio(page);
+    const cash = await this.extractCash(page);
 
-    // We deliberately do NOT emit "יתרה למסחר" (balance available for trading) as portfolio
-    // cash: it mirrors the linked checking-account balance, which the bank_account
-    // transactions scraper already reports. Emitting it here would double-count net worth.
-    return { positions, cash: [], asOfDate };
+    // The FIBI checking (עו"ש) balance is emitted here as the SINGLE source of that value for
+    // net worth — it must never also be counted as a standalone bank-account line elsewhere.
+    return { positions, cash, asOfDate };
   }
 
   private async login(
@@ -182,5 +185,53 @@ export class BeinleumiPortfolioScraper extends BasePortfolioScraper {
     }
 
     return { positions, asOfDate };
+  }
+
+  /**
+   * Reads the current עו"ש checking balance and returns it as ILS portfolio cash.
+   *
+   * Uses the same same-origin-iframe technique as extractPortfolio: we must NOT navigate the
+   * top frame (FIBI's PortalNG SSO exchange races on hard navigations and bounces the tab to
+   * the public site, whose cookieCleaner wipes the session). Best-effort: any failure returns
+   * [] so the portfolio scrape still succeeds on its positions alone.
+   */
+  private async extractCash(page: Page): Promise<PortfolioCash[]> {
+    const IFRAME_ID = 'ibs-balance-probe';
+    try {
+      await page.evaluate(
+        (id: string, url: string) => {
+          const existing = document.getElementById(id);
+          if (existing) existing.remove();
+          const ifr = document.createElement('iframe');
+          ifr.id = id;
+          ifr.style.cssText = 'position:absolute;left:-9999px;width:1400px;height:1000px';
+          ifr.src = url;
+          document.body.appendChild(ifr);
+        },
+        IFRAME_ID,
+        BALANCE_URL,
+      );
+
+      await page.waitForFunction(
+        (id: string) => {
+          const ifr = document.getElementById(id) as HTMLIFrameElement | null;
+          const el = ifr?.contentDocument?.querySelector('.main_balance') as HTMLElement | null;
+          return !!el && el.innerText.trim().length > 0;
+        },
+        { timeout: 60_000 },
+        IFRAME_ID,
+      );
+
+      const raw = await page.evaluate((id: string) => {
+        const ifr = document.getElementById(id) as HTMLIFrameElement | null;
+        const el = ifr?.contentDocument?.querySelector('.main_balance') as HTMLElement | null;
+        return el ? el.innerText : null;
+      }, IFRAME_ID);
+
+      if (raw == null) return [];
+      return [{ currency: 'ILS', amount: parseNumber(raw) }];
+    } catch {
+      return [];
+    }
   }
 }
