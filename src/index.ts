@@ -29,3 +29,10 @@ export type {
 export { BasePortfolioScraper } from './portfolio-scrapers/base-portfolio-scraper';
 export type { BasePortfolioScraperOptions } from './portfolio-scrapers/base-portfolio-scraper';
 export type { PortfolioScraperOptions } from './portfolio-scrapers/factory';
+
+export { PensionCompanyTypes, PENSION_SCRAPERS } from './pension-definitions';
+export { createPensionScraper } from './pension-scrapers/factory';
+export type { PensionScraper, PensionHoldingOutput, PensionScrapingResult } from './pension-scrapers/interface';
+export { BasePensionScraper } from './pension-scrapers/base-pension-scraper';
+export type { BasePensionScraperOptions } from './pension-scrapers/base-pension-scraper';
+export type { PensionScraperOptions } from './pension-scrapers/factory';
