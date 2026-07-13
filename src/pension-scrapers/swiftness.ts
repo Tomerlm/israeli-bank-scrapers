@@ -178,6 +178,14 @@ export class SwiftnessPensionScraper extends BasePensionScraper {
 
     // ── Interceptor: the getSavingProductsDetails API response ───────────
     let capturedProducts: unknown[] | undefined;
+    // The saver desktop's own API calls (e.g. getDesktopEventStatus?swiftnessKey=<uuid>) carry the
+    // per-retrieval swiftnessKey — capture it from any request URL rather than relying on it being
+    // in localStorage (it isn't, until you navigate into a holdings page) or on DOM clicking.
+    let capturedSwiftnessKey: string | null = null;
+    page.on('request', request => {
+      const m = /swiftnessKey=([0-9a-fA-F-]{36})/.exec(request.url());
+      if (m && !capturedSwiftnessKey) capturedSwiftnessKey = m[1];
+    });
     page.on('response', response => {
       const url = response.url();
       if (!url.includes(API_MARKER)) return;
@@ -190,10 +198,17 @@ export class SwiftnessPensionScraper extends BasePensionScraper {
         .catch(() => undefined);
     });
 
-    // ── 1. Login ───────────────────────────────────────────────────────
-    await page.goto(LOGIN_URL, { waitUntil: 'networkidle2', timeout: 60_000 });
-    // eslint-disable-next-line no-console
-    console.log('[swiftness-scraper] login page loaded');
+    // ── 1. Login (skipped if a persistent session is already authenticated) ─
+    // A caller may pass --user-data-dir in args to persist the session across runs; if that session
+    // is still valid we land on the saver domain authenticated and can skip the whole login/OTP.
+    await page.goto(`https://${SAVER_HOST}/`, { waitUntil: 'networkidle2', timeout: 60_000 }).catch(() => undefined);
+    const alreadyAuthed =
+      page.url().includes(SAVER_HOST) &&
+      (await page.evaluate(() => !!localStorage.getItem('auth_token')).catch(() => false));
+    if (!alreadyAuthed) {
+      await page.goto(LOGIN_URL, { waitUntil: 'networkidle2', timeout: 60_000 });
+      // eslint-disable-next-line no-console
+      console.log('[swiftness-scraper] login page loaded');
 
     const toggleText = otpChannel === 'email' ? 'מייל' : 'סמס';
     await clickButtonByText(page, toggleText);
@@ -233,43 +248,89 @@ export class SwiftnessPensionScraper extends BasePensionScraper {
       const count = await markOtpInputs(page, MARK_OTP_PREFIX);
       if (count >= 6) {
         const code = await otpCodeRetriever();
-        for (let i = 0; i < 6; i++) {
-          await page.type(`input[data-ibs-mark="${MARK_OTP_PREFIX}-${i}"]`, code[i] ?? '');
-        }
+        // These OTP boxes are a React component that auto-advances focus on each keystroke.
+        // Setting values programmatically fights its internal state (only some digits stick).
+        // The reliable way is to focus the first box and type the whole code as real keystrokes,
+        // letting the component advance focus box-to-box itself — exactly like a human.
+        await page.focus(`input[data-ibs-mark="${MARK_OTP_PREFIX}-0"]`);
+        await page.keyboard.type(code, { delay: 80 });
       }
     }
 
     // ── 3. Wait for redirect to the saver desktop ─────────────────────
-    await page.waitForFunction(
-      function onSaverDomain(host: string) {
-        return location.hostname.includes(host);
-      },
-      { timeout: 60_000 },
-      SAVER_HOST,
-    );
-    // eslint-disable-next-line no-console
-    console.log('[swiftness-scraper] logged in, redirected to savernew');
+    try {
+      await page.waitForFunction(
+        function onSaverDomain(host: string) {
+          return location.hostname.includes(host);
+        },
+        { timeout: 60_000 },
+        SAVER_HOST,
+      );
+    } catch (e) {
+      // Diagnostic: capture what the page looks like when the post-OTP redirect never happens
+      // (e.g. an OTP-rejected error still on the auth screen).
+      try {
+        await page.screenshot({ path: `/tmp/swiftness-otp-fail-${Date.now()}.png` });
+        const visible = await page.evaluate(() => document.body.innerText.slice(0, 400));
+        // eslint-disable-next-line no-console
+        console.log('[swiftness-scraper] post-OTP redirect failed; page text:', visible);
+      } catch {
+        // ignore diagnostic failures
+      }
+      throw e;
+    }
+      // eslint-disable-next-line no-console
+      console.log('[swiftness-scraper] logged in, redirected to savernew');
+    } else {
+      // eslint-disable-next-line no-console
+      console.log('[swiftness-scraper] reusing existing authenticated session, skipping login');
+    }
 
     // ── 4. Resolve swiftnessKey and reach the holdings page ────────────
-    let swiftnessKey = await readSwiftnessKey(page);
+    // The swiftnessKey lands either in the desktop's own API request URLs (captured above) or in
+    // localStorage (cachedSwiftnessKey) a few seconds after the desktop finishes loading — poll both.
+    let swiftnessKey: string | null = null;
+    {
+      const deadline = Date.now() + 20_000;
+      while (Date.now() < deadline) {
+        swiftnessKey = capturedSwiftnessKey ?? (await readSwiftnessKey(page).catch(() => null));
+        if (swiftnessKey) break;
+        await new Promise(r => setTimeout(r, 500));
+      }
+    }
     if (!swiftnessKey) {
+      // Fallback: wait for the completed-request card to render, then click it to navigate in.
       // eslint-disable-next-line no-console
-      console.log('[swiftness-scraper] no cached swiftnessKey, clicking completed-request button');
-      await clickButtonByText(page, 'התקבל מידע מלא');
+      console.log('[swiftness-scraper] swiftnessKey not captured, waiting for completed-request button');
       await page
         .waitForFunction(
-          function swiftnessKeyInUrl() {
-            return location.href.includes('swiftnessKey=');
+          function completedRequestButtonReady() {
+            return Array.from(document.querySelectorAll('button')).some(b =>
+              (b.textContent ?? '').includes('מידע מלא'),
+            );
           },
-          { timeout: 30_000 },
+          { timeout: 45_000 },
         )
         .catch(() => undefined);
+      await page.evaluate(function clickCompletedRequest() {
+        const btn = Array.from(document.querySelectorAll('button')).find(b =>
+          (b.textContent ?? '').includes('מידע מלא'),
+        );
+        if (btn instanceof HTMLElement) btn.click();
+      });
+      await page
+        .waitForFunction(function swiftnessKeyInUrl() { return location.href.includes('swiftnessKey='); }, {
+          timeout: 30_000,
+        })
+        .catch(() => undefined);
       const match = /swiftnessKey=([^&]+)/.exec(page.url());
-      swiftnessKey = match ? match[1] : null;
+      swiftnessKey = capturedSwiftnessKey ?? (match ? match[1] : null) ?? (await readSwiftnessKey(page));
     }
     if (!swiftnessKey) {
       throw new Error('Swiftness: could not resolve swiftnessKey after login');
     }
+    // eslint-disable-next-line no-console
+    console.log('[swiftness-scraper] resolved swiftnessKey');
 
     await page.goto(`https://${SAVER_HOST}/holdings/myProducts?swiftnessKey=${swiftnessKey}&eventType=9100`, {
       waitUntil: 'networkidle2',
