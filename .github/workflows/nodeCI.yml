@@ -1,0 +1,26 @@
+name: Node CI
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    if: github.ref != 'refs/heads/master'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macOS-latest]
+    steps:
+    - uses: actions/checkout@v4
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version-file: .nvmrc
+    - uses: browser-actions/setup-chrome@v1
+    - name: npm install and test
+      env:
+        PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: ${{ runner.os == 'macOS-latest' && 'true' || 'false' }}
+      run: |
+        npm ci
+        npm run test:ci
+    - name: Verify prepare:core
+      run: npm run prepare:core
