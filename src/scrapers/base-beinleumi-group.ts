@@ -328,8 +328,10 @@ async function handleOtpChallenge(page: Page, otpCodeRetriever: () => Promise<st
   const otpCode = await otpCodeRetriever();
   await fillInput(page, OTP_INPUT_SELECTOR, otpCode);
   await clickButton(page, OTP_SUBMIT_SELECTOR);
-  // Wait for the post-login dashboard to appear after successful OTP
-  await Promise.race([
+  // Wait for the post-login dashboard to appear after successful OTP.
+  // Promise.any (not race): the dashboard renders exactly one of these markers;
+  // the others never appear and would otherwise reject the whole wait on timeout.
+  await Promise.any([
     waitUntilElementFound(page, '#card-header', false),
     waitUntilElementFound(page, '#account_num', true),
     waitUntilElementFound(page, '#matafLogoutLink', true),
@@ -339,20 +341,29 @@ async function handleOtpChallenge(page: Page, otpCodeRetriever: () => Promise<st
 
 export async function waitForPostLogin(page: Page, otpCodeRetriever?: () => Promise<string>) {
   if (otpCodeRetriever) {
-    // Race the OTP challenge page against the success page selectors.
-    // The dashboard-detection branches use a long timeout so they don't reject
-    // while the OTP retriever is paused waiting for the user to supply the code.
-    // (handleOtpChallenge has its own inner wait for dashboard elements after submit.)
-    const NO_OTP_TIMEOUT_MS = 180_000;
-    await Promise.race([
-      waitUntilElementFound(page, OTP_SEND_SMS_SELECTOR, true).then(() => handleOtpChallenge(page, otpCodeRetriever)),
-      waitUntilElementFound(page, '#card-header', false, NO_OTP_TIMEOUT_MS),
-      waitUntilElementFound(page, '#account_num', true, NO_OTP_TIMEOUT_MS),
-      waitUntilElementFound(page, '#matafLogoutLink', true, NO_OTP_TIMEOUT_MS),
-      waitUntilElementFound(page, '#validationMsg', true, NO_OTP_TIMEOUT_MS),
+    // Detect whichever page follows login: the OTP challenge (#sendSms) OR, if no
+    // 2FA is required this session, one of the dashboard markers.
+    //
+    // Promise.any (NOT race): with `race`, the FIRST branch to *settle* wins — and
+    // waitUntilElementFound REJECTS on timeout. So a losing branch timing out would
+    // abort the whole login, even while the OTP branch is legitimately paused waiting
+    // for the user to type the code. Two real prod failures came from exactly this:
+    // the #sendSms branch's default 30s reject killed clean no-OTP logins, and the
+    // 180s dashboard branches rejected mid-OTP (before the 5-min user window closed).
+    // Promise.any ignores rejections and settles on the first FULFILLMENT, so the OTP
+    // branch can stay pending as long as the user needs; it only rejects if ALL fail.
+    const DETECT_TIMEOUT_MS = 180_000;
+    await Promise.any([
+      waitUntilElementFound(page, OTP_SEND_SMS_SELECTOR, true, DETECT_TIMEOUT_MS).then(() => handleOtpChallenge(page, otpCodeRetriever)),
+      waitUntilElementFound(page, '#card-header', false, DETECT_TIMEOUT_MS),
+      waitUntilElementFound(page, '#account_num', true, DETECT_TIMEOUT_MS),
+      waitUntilElementFound(page, '#matafLogoutLink', true, DETECT_TIMEOUT_MS),
+      waitUntilElementFound(page, '#validationMsg', true, DETECT_TIMEOUT_MS),
     ]);
   } else {
-    await Promise.race([
+    // Same reasoning: exactly one dashboard marker renders; the others time out and
+    // must not abort the wait. Promise.any settles on the one that appears.
+    await Promise.any([
       waitUntilElementFound(page, '#card-header', false), // New UI
       waitUntilElementFound(page, '#account_num', true), // New UI
       waitUntilElementFound(page, '#matafLogoutLink', true), // Old UI
