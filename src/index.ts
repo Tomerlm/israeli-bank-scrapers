@@ -36,3 +36,6 @@ export type { PensionScraper, PensionHoldingOutput, PensionScrapingResult } from
 export { BasePensionScraper } from './pension-scrapers/base-pension-scraper';
 export type { BasePensionScraperOptions } from './pension-scrapers/base-pension-scraper';
 export type { PensionScraperOptions } from './pension-scrapers/factory';
+
+export type { MortgageAccount, MortgageTrack } from './scrapers/mortgageScrapers/types';
+export { createBeinleumiMortgageScraper } from './scrapers/mortgageScrapers/beinleumi';
