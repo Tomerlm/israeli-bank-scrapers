@@ -130,98 +130,96 @@ async function extractMortgages(page: Page): Promise<MortgageAccount | null> {
     const extracted = await page.evaluate((id: string) => {
       const ifr = document.getElementById(id) as HTMLIFrameElement | null;
       const doc = ifr?.contentDocument;
-      if (!doc) return { rows: [] as Array<{ labelValues: Record<string, string> }>, dateText: '' };
+      if (!doc) return { mortgages: [] as Array<{ labelValues: Record<string, string> }>, dateText: '' };
 
-      const rows = Array.from(doc.querySelectorAll('table tbody tr')).map((tr) => {
-        const row = tr as HTMLTableRowElement;
-        // Extract label-value pairs from this row
-        // Using style="font-weight:bold" to detect label cells
+      // Parse all label-value pairs from all <tr> elements in all <table> elements
+      // Each mortgage detail page has label-value pairs in <tr><td style="font-weight:bold">Label</td><td>Value</td></tr>
+      const allTables = Array.from(doc.querySelectorAll('table'));
+      const mortgages: Array<{ labelValues: Record<string, string> }> = [];
+
+      for (const table of allTables) {
         const labelValues: Record<string, string> = {};
+        const rows = Array.from(table.querySelectorAll('tr'));
 
-        // Expected field labels (in Hebrew):
-        // סוג המשכנתא / סוג הריבית (track type / interest type)
-        // יתרת קרן (outstanding principal)
-        // תשלום חודשי (monthly payment)
-        // שיעור הריבית (interest rate)
-        // טווח זמן שנותר (remaining term)
-        // צמד ל- (linkage/indexation)
-        // סכום המשכנתא המקורי (original loan amount)
+        for (const row of rows) {
+          const cells = Array.from(row.querySelectorAll('td'));
+          if (cells.length >= 2) {
+            const firstCell = cells[0] as HTMLElement;
+            // Check if first cell has bold font-weight
+            const isBoldLabel = firstCell.style?.fontWeight === 'bold' ||
+                               getComputedStyle(firstCell)?.fontWeight === 'bold' ||
+                               /bold/.test(firstCell.getAttribute('style') ?? '');
 
-        const cells = Array.from(row.querySelectorAll('td'));
-        for (let i = 0; i < cells.length; i++) {
-          const cell = cells[i] as HTMLElement;
-          if (cell.style?.fontWeight === 'bold') {
-            const label = cell.innerText?.trim() ?? '';
-            const nextCell = cells[i + 1];
-            const value = nextCell ? (nextCell as HTMLElement).innerText?.trim() ?? '' : '';
-            if (label && value) {
-              labelValues[label] = value;
+            if (isBoldLabel) {
+              const label = firstCell.innerText?.trim() ?? '';
+              const value = (cells[1] as HTMLElement).innerText?.trim() ?? '';
+              if (label && value) {
+                labelValues[label] = value;
+              }
             }
           }
         }
 
-        return { labelValues };
-      });
+        // Only add to results if we found at least one label-value pair
+        if (Object.keys(labelValues).length > 0) {
+          mortgages.push({ labelValues });
+        }
+      }
 
       // Extract as-of date from page text (if available)
       const bodyText = doc.body?.innerText ?? '';
       const dateMatch = bodyText.match(/תאריך:\s*(\d{2})\.(\d{2})\.(\d{4})/);
       const dateText = dateMatch ? `${dateMatch[3]}-${dateMatch[2]}-${dateMatch[1]}` : '';
 
-      return { rows, dateText };
+      return { mortgages, dateText };
     }, IFRAME_ID);
 
     const asOfDate = extracted.dateText || new Date().toISOString().slice(0, 10);
 
     // Check if we found any mortgages
-    if (extracted.rows.length === 0) {
+    if (extracted.mortgages.length === 0) {
       return null; // No mortgages — graceful exit
     }
 
-    // Parse each row into a MortgageTrack
-    const tracks: MortgageTrack[] = [];
+    // Since we're on a single mortgage detail page, we extract ONE mortgage account
+    // with ALL the label-value pairs collected from the page
+    const { labelValues } = extracted.mortgages[0];
 
-    for (const rowData of extracted.rows) {
-      const { labelValues } = rowData;
+    // Map Hebrew labels to field names from discovery document (§4)
+    // These exact labels were found in the real page on 2026-07-15
+    const trackType = labelValues['מסלול'] || labelValues['סוג הלוואה'] || 'Unknown';
+    const outstandingPrincipal = parseNumber(labelValues['יתרת קרן']);
+    const monthlyPayment = parseNumber(labelValues['החזר חודשי']);
+    const interestRateStr = labelValues['ריבית'] || '';
+    // Rate is already in PERCENT — do NOT divide by 100 (different from Psagot)
+    const interestRate = parseNumber(interestRateStr);
+    const remainingTermStr = labelValues['תקופה שנותרה'] || '';
+    // Parse remaining term (usually "X חודשים" = X months)
+    const remainingTermMatch = remainingTermStr.match(/(\d+)/);
+    const remainingTerm = remainingTermMatch ? parseInt(remainingTermMatch[1], 10) : null;
+    const linkage = labelValues['הצמדה'] || 'לא צמודה';
+    const originalAmount = parseNumber(labelValues['סכום הלוואה מקורי']);
 
-      // Map Hebrew labels to field names. These are approximate — actual page may vary.
-      // Will be updated based on real discovery findings.
-      const trackType = labelValues['סוג המשכנתא'] || labelValues['סוג הריבית'] || 'Unknown';
-      const outstandingPrincipal = parseNumber(labelValues['יתרת קרן']);
-      const monthlyPayment = parseNumber(labelValues['תשלום חודשי']);
-      const interestRateStr = labelValues['שיעור הריבית'] || '';
-      // Rate is already in percent — do NOT divide by 100
-      const interestRate = parseNumber(interestRateStr);
-      const remainingTermStr = labelValues['טווח זמן שנותר'] || '';
-      // Parse remaining term (usually "X חודשים" = X months)
-      const remainingTermMatch = remainingTermStr.match(/(\d+)/);
-      const remainingTerm = remainingTermMatch ? parseInt(remainingTermMatch[1], 10) : null;
-      const linkage = labelValues['צמד ל-'] || 'No Indexation';
-      const originalAmount = parseNumber(labelValues['סכום המשכנתא המקורי']);
-
-      // Skip rows with zero outstanding balance (likely headers or empty rows)
-      if (outstandingPrincipal === 0) continue;
-
-      tracks.push({
-        trackType,
-        originalLoanAmountIls: originalAmount,
-        outstandingPrincipalIls: outstandingPrincipal,
-        monthlyPaymentIls: monthlyPayment,
-        interestRatePercent: interestRate,
-        remainingTermMonths: remainingTerm,
-        linkage,
-        asOfDate,
-      });
+    // Skip if no outstanding balance (shouldn't happen for valid mortgages)
+    if (outstandingPrincipal === 0) {
+      return null;
     }
 
-    if (tracks.length === 0) {
-      return null; // No valid mortgage tracks found
-    }
+    const track: MortgageTrack = {
+      trackType,
+      originalLoanAmountIls: originalAmount,
+      outstandingPrincipalIls: outstandingPrincipal,
+      monthlyPaymentIls: monthlyPayment,
+      interestRatePercent: interestRate,
+      remainingTermMonths: remainingTerm,
+      linkage,
+      asOfDate,
+    };
 
     return {
-      lender: 'בנק לאומי', // Beinleumi in Hebrew (for consistency)
+      lender: 'בנק לאומי', // Beinleumi in Hebrew
       currency: 'ILS',
-      tracks,
+      tracks: [track],
       asOfDate,
     };
   } catch (error) {
