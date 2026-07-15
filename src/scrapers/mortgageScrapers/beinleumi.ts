@@ -84,18 +84,44 @@ async function loginBeinleumi(
 }
 
 /**
+ * Compute whole months between an as-of date (YYYY-MM-DD) and a future
+ * "last payment" date (dd.mm.yyyy). Returns null if the date can't be parsed.
+ */
+function monthsBetween(asOfIso: string, lastPaymentDmy: string | null): number | null {
+  if (!lastPaymentDmy) return null;
+  const m = lastPaymentDmy.match(/(\d{2})\.(\d{2})\.(\d{4})/);
+  if (!m) return null;
+  const last = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+  const asOf = new Date(asOfIso);
+  if (Number.isNaN(last.getTime()) || Number.isNaN(asOf.getTime())) return null;
+  const months = (last.getFullYear() - asOf.getFullYear()) * 12 + (last.getMonth() - asOf.getMonth());
+  return months > 0 ? months : null;
+}
+
+/**
  * Extract mortgages from the classic portlet page using iframe injection.
  *
  * We must NOT navigate the top window to MORTGAGE_URL: FIBI's PortalNG shell bounces on hard
  * navigations and wipes the session. Instead, we inject a same-origin iframe pointing at the
  * classic portlet URL — the iframe renders the portlet without moving the top frame.
  *
- * Returns null if no mortgages found or iframe times out.
+ * Flow (verified against the live page on 2026-07-15, account 008-575572):
+ *   1. Inject iframe → MORTGAGE_URL (the mortgage *summary* page "המשכנתאות שלי").
+ *      This page has ONLY aggregate totals + a per-track-type breakdown — NO per-loan
+ *      detail. It exposes a "לפירוט משכנתאות >" link: `javascript:goToBackasha(<id>)`.
+ *   2. Read the backasha id from that link and call goToBackasha(id) inside the iframe.
+ *      This navigates the portlet (in place, no top-window bounce) to the *detail* page
+ *      "פירוט משכנתאות", which renders one `table.tbl_layout` per mortgage sub-track,
+ *      each carrying its own rate / principal / monthly payment / original amount / term.
+ *   3. Parse each sub-track table into a MortgageTrack.
+ *
+ * Returns null if no mortgages found or the iframe/detail page times out.
  */
 async function extractMortgages(page: Page): Promise<MortgageAccount | null> {
   const IFRAME_ID = 'ibs-mortgage-probe';
 
   try {
+    // ── Step 1: inject the iframe pointing at the mortgage summary page ────────
     await page.evaluate(
       (id: string, url: string) => {
         const existing = document.getElementById(id);
@@ -110,116 +136,144 @@ async function extractMortgages(page: Page): Promise<MortgageAccount | null> {
       MORTGAGE_URL,
     );
 
-    // Wait for the mortgage table to render. Allow for "no mortgages" message.
+    // Wait for the summary page to render: either the "details" navigation link
+    // (goToBackasha) appears, or an explicit "no mortgages" message.
     await page.waitForFunction(
       (id: string) => {
         const ifr = document.getElementById(id) as HTMLIFrameElement | null;
         const doc = ifr?.contentDocument;
         if (!doc) return false;
-        // Either at least one mortgage row, or "no mortgages" message
-        return (
-          doc.querySelectorAll('table tbody tr').length > 0 ||
-          /אין משכנתאות|לא נמצאו|לא קיימות/.test(doc.body?.innerText ?? '')
+        const hasDetailLink = Array.from(doc.querySelectorAll('a')).some((a) =>
+          /goToBackasha\(\s*\d+\s*\)/.test(a.getAttribute('href') ?? ''),
         );
+        const noMortgages = /אין משכנתאות|לא נמצאו|לא קיימות/.test(doc.body?.innerText ?? '');
+        return hasDetailLink || noMortgages;
       },
-      { timeout: 10_000 },
+      { timeout: 30_000 },
       IFRAME_ID,
     );
 
-    // Extract mortgage data from the iframe
+    // Read the backasha id from the "לפירוט משכנתאות >" link.
+    const backashaId = await page.evaluate((id: string) => {
+      const ifr = document.getElementById(id) as HTMLIFrameElement | null;
+      const doc = ifr?.contentDocument;
+      if (!doc) return null;
+      const link = Array.from(doc.querySelectorAll('a')).find((a) =>
+        /goToBackasha\(\s*\d+\s*\)/.test(a.getAttribute('href') ?? ''),
+      );
+      if (!link) return null;
+      const m = (link.getAttribute('href') ?? '').match(/goToBackasha\(\s*(\d+)\s*\)/);
+      return m ? Number(m[1]) : null;
+    }, IFRAME_ID);
+
+    // No detail link → no mortgages on this account. Graceful exit.
+    if (backashaId == null) {
+      return null;
+    }
+
+    // ── Step 2: navigate the portlet to the per-loan detail page ──────────────
+    await page.evaluate(
+      (id: string, bid: number) => {
+        const ifr = document.getElementById(id) as HTMLIFrameElement | null;
+        const win = ifr?.contentWindow as (Window & { goToBackasha?: (n: number) => void }) | null;
+        win?.goToBackasha?.(bid);
+      },
+      IFRAME_ID,
+      backashaId,
+    );
+
+    // Wait for the detail page: at least one per-sub-track table
+    // ("ריבית נוכחית (ליום מסירת המידע)" + "מסלול:") must render.
+    await page.waitForFunction(
+      (id: string) => {
+        const ifr = document.getElementById(id) as HTMLIFrameElement | null;
+        const doc = ifr?.contentDocument;
+        if (!doc) return false;
+        return Array.from(doc.querySelectorAll('table')).some(
+          (t) =>
+            /ריבית נוכחית \(ליום מסירת המידע\)/.test((t as HTMLElement).innerText) &&
+            /מסלול:/.test((t as HTMLElement).innerText),
+        );
+      },
+      { timeout: 30_000 },
+      IFRAME_ID,
+    );
+
+    // ── Step 3: parse every sub-track table into raw label→value records ──────
     const extracted = await page.evaluate((id: string) => {
       const ifr = document.getElementById(id) as HTMLIFrameElement | null;
       const doc = ifr?.contentDocument;
-      if (!doc) return { mortgages: [] as Array<{ labelValues: Record<string, string> }>, dateText: '' };
+      if (!doc) return { tracks: [] as Array<Record<string, string>>, dateText: '' };
 
-      // Parse all label-value pairs from all <tr> elements in all <table> elements
-      // Each mortgage detail page has label-value pairs in <tr><td style="font-weight:bold">Label</td><td>Value</td></tr>
-      const allTables = Array.from(doc.querySelectorAll('table'));
-      const mortgages: Array<{ labelValues: Record<string, string> }> = [];
+      // Each mortgage sub-track is a table carrying both the "current interest
+      // rate" label and the "track:" label. Within it, labels and values are
+      // adjacent cells: [ ..., "label:", "value", ... ].
+      const subTrackTables = Array.from(doc.querySelectorAll('table')).filter(
+        (t) =>
+          /ריבית נוכחית \(ליום מסירת המידע\)/.test((t as HTMLElement).innerText) &&
+          /מסלול:/.test((t as HTMLElement).innerText),
+      );
 
-      for (const table of allTables) {
-        const labelValues: Record<string, string> = {};
+      const grab = (table: Element, label: string): string => {
         const rows = Array.from(table.querySelectorAll('tr'));
-
         for (const row of rows) {
-          const cells = Array.from(row.querySelectorAll('td'));
-          if (cells.length >= 2) {
-            const firstCell = cells[0] as HTMLElement;
-            // Check if first cell has bold font-weight
-            const isBoldLabel = firstCell.style?.fontWeight === 'bold' ||
-                               getComputedStyle(firstCell)?.fontWeight === 'bold' ||
-                               /bold/.test(firstCell.getAttribute('style') ?? '');
-
-            if (isBoldLabel) {
-              const label = firstCell.innerText?.trim() ?? '';
-              const value = (cells[1] as HTMLElement).innerText?.trim() ?? '';
-              if (label && value) {
-                labelValues[label] = value;
-              }
-            }
+          const cells = Array.from(row.querySelectorAll('td,th')).map((c) =>
+            (c as HTMLElement).innerText.replace(/\s+/g, ' ').trim(),
+          );
+          for (let j = 0; j < cells.length - 1; j++) {
+            if (cells[j].indexOf(label) === 0) return cells[j + 1];
           }
         }
+        return '';
+      };
 
-        // Only add to results if we found at least one label-value pair
-        if (Object.keys(labelValues).length > 0) {
-          mortgages.push({ labelValues });
-        }
-      }
+      const tracks = subTrackTables.map((t) => ({
+        trackType: grab(t, 'מסלול:'),
+        rate: grab(t, 'ריבית נוכחית (ליום מסירת המידע):'),
+        // "יתרה לסילוק" (balance to settle) is the true payoff the bank shows as
+        // the account total; it reconciles to the summary headline total.
+        balance: grab(t, 'יתרה לסילוק'),
+        original: grab(t, 'סכום תת הלוואה מקורי:'),
+        monthly: grab(t, 'תשלום אחרון לחיוב'),
+        linkage: grab(t, 'בסיס ההצמדה:'),
+        lastPayment: grab(t, 'המועד הצפוי לתשלום האחרון:'),
+      }));
 
-      // Extract as-of date from page text (if available)
+      // As-of date: prefer "נכון ל:dd/mm/yyyy", fall back to "תאריך:dd/mm/yyyy".
       const bodyText = doc.body?.innerText ?? '';
-      const dateMatch = bodyText.match(/תאריך:\s*(\d{2})\.(\d{2})\.(\d{4})/);
+      const dateMatch =
+        bodyText.match(/נכון ל:\s*(\d{2})\/(\d{2})\/(\d{4})/) ||
+        bodyText.match(/תאריך:\s*(\d{2})\/(\d{2})\/(\d{4})/);
       const dateText = dateMatch ? `${dateMatch[3]}-${dateMatch[2]}-${dateMatch[1]}` : '';
 
-      return { mortgages, dateText };
+      return { tracks, dateText };
     }, IFRAME_ID);
 
     const asOfDate = extracted.dateText || new Date().toISOString().slice(0, 10);
 
-    // Check if we found any mortgages
-    if (extracted.mortgages.length === 0) {
-      return null; // No mortgages — graceful exit
+    const tracks: MortgageTrack[] = extracted.tracks
+      .map((raw) => ({
+        trackType: raw.trackType || 'Unknown',
+        originalLoanAmountIls: parseNumber(raw.original),
+        // Rate is already in PERCENT — do NOT divide by 100 (different from Psagot).
+        outstandingPrincipalIls: parseNumber(raw.balance),
+        monthlyPaymentIls: parseNumber(raw.monthly),
+        interestRatePercent: parseNumber(raw.rate),
+        remainingTermMonths: monthsBetween(asOfDate, raw.lastPayment || null),
+        linkage: raw.linkage || 'לא צמודה',
+        asOfDate,
+      }))
+      // Drop any table that yielded no outstanding balance (defensive).
+      .filter((t) => t.outstandingPrincipalIls > 0);
+
+    if (tracks.length === 0) {
+      return null; // No usable mortgage tracks — graceful exit.
     }
-
-    // Since we're on a single mortgage detail page, we extract ONE mortgage account
-    // with ALL the label-value pairs collected from the page
-    const { labelValues } = extracted.mortgages[0];
-
-    // Map Hebrew labels to field names from discovery document (§4)
-    // These exact labels were found in the real page on 2026-07-15
-    const trackType = labelValues['מסלול'] || labelValues['סוג הלוואה'] || 'Unknown';
-    const outstandingPrincipal = parseNumber(labelValues['יתרת קרן']);
-    const monthlyPayment = parseNumber(labelValues['החזר חודשי']);
-    const interestRateStr = labelValues['ריבית'] || '';
-    // Rate is already in PERCENT — do NOT divide by 100 (different from Psagot)
-    const interestRate = parseNumber(interestRateStr);
-    const remainingTermStr = labelValues['תקופה שנותרה'] || '';
-    // Parse remaining term (usually "X חודשים" = X months)
-    const remainingTermMatch = remainingTermStr.match(/(\d+)/);
-    const remainingTerm = remainingTermMatch ? parseInt(remainingTermMatch[1], 10) : null;
-    const linkage = labelValues['הצמדה'] || 'לא צמודה';
-    const originalAmount = parseNumber(labelValues['סכום הלוואה מקורי']);
-
-    // Skip if no outstanding balance (shouldn't happen for valid mortgages)
-    if (outstandingPrincipal === 0) {
-      return null;
-    }
-
-    const track: MortgageTrack = {
-      trackType,
-      originalLoanAmountIls: originalAmount,
-      outstandingPrincipalIls: outstandingPrincipal,
-      monthlyPaymentIls: monthlyPayment,
-      interestRatePercent: interestRate,
-      remainingTermMonths: remainingTerm,
-      linkage,
-      asOfDate,
-    };
 
     return {
       lender: 'בנק לאומי', // Beinleumi in Hebrew
       currency: 'ILS',
-      tracks: [track],
+      tracks,
       asOfDate,
     };
   } catch (error) {
