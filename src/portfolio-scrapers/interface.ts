@@ -13,8 +13,20 @@ export type PortfolioCash = {
   amount: number;
 };
 
+export type PortfolioDeposit = {
+  identifier: string;
+  name: string;
+  currency: string;
+  principal: number;
+  currentValue: number;
+  maturityDate?: string;
+  openDate?: string;
+  interestRatePercent?: number;
+  linkage?: string;
+};
+
 export type PortfolioScrapingResult =
-  | { success: true; positions: PortfolioPosition[]; cash: PortfolioCash[]; asOfDate: string }
+  | { success: true; positions: PortfolioPosition[]; cash: PortfolioCash[]; deposits?: PortfolioDeposit[]; asOfDate: string }
   | { success: false; errorType: string; errorMessage: string };
 
 export interface PortfolioScraper {

@@ -1,10 +1,11 @@
 import { type Page } from 'puppeteer';
 import { BasePortfolioScraper } from './base-portfolio-scraper';
-import type { PortfolioCash, PortfolioPosition } from './interface';
+import type { PortfolioCash, PortfolioDeposit, PortfolioPosition } from './interface';
 export declare class BeinleumiPortfolioScraper extends BasePortfolioScraper {
     protected fetchPortfolio(page: Page, credentials: Record<string, unknown>): Promise<{
         positions: PortfolioPosition[];
         cash: PortfolioCash[];
+        deposits: PortfolioDeposit[];
         asOfDate: string;
     }>;
     private login;
@@ -28,4 +29,16 @@ export declare class BeinleumiPortfolioScraper extends BasePortfolioScraper {
      * [] so the portfolio scrape still succeeds on its positions alone.
      */
     private extractCash;
+    /**
+     * Reads term deposits/savings ("פקדונות וחסכונות") from the modern Angular shell's
+     * myDeposits route. Unlike extractPortfolio/extractCash this needs no iframe injection and
+     * no DOM scraping at all: post-login FIBI already leaves the top frame on the shell
+     * document, so a same-document hash change is enough to trigger the Angular route (verified
+     * live — it does not bounce the session the way a hard navigation to a shell URL would), and
+     * that route fires exactly one JSON REST call (bff-MyDeposits) with everything we need,
+     * including each deposit's own interest rate — no "more details" click required.
+     * Best-effort: any failure returns [] so the portfolio scrape still succeeds on its
+     * positions/cash alone.
+     */
+    private extractDeposits;
 }
