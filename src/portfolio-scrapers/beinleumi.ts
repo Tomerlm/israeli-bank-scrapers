@@ -1,6 +1,6 @@
 import { type Page } from 'puppeteer';
 import { BasePortfolioScraper } from './base-portfolio-scraper';
-import type { PortfolioCash, PortfolioPosition } from './interface';
+import type { PortfolioCash, PortfolioDeposit, PortfolioPosition } from './interface';
 
 const BASE_URL = 'https://online.fibi.co.il';
 const LOGIN_URL = `${BASE_URL}/MatafLoginService/MatafLoginServlet?bankId=FIBIPORTAL&site=Private&KODSAFA=HE`;
@@ -10,6 +10,14 @@ const PORTFOLIO_URL = `${BASE_URL}/wps/myportal/FibiMenu/Online/OnCapitalMarket/
 // Classic account-balance/transactions view. Its `.main_balance` element holds the current
 // עו"ש balance (same selector the transactions scraper reads in base-beinleumi-group.ts).
 const BALANCE_URL = `${BASE_URL}/wps/myportal/FibiMenu/Online/OnAccountMngment/OnBalanceTrans/PrivateAccountFlow`;
+// Deposits/savings ("פקדונות וחסכונות") live in the *modern* Angular PortalNG shell, not the
+// classic WebSphere portlets above — there is no legacy /wps/myportal twin for this one.
+// Post-login FIBI already lands the top frame on the shell document itself, so a plain
+// same-document hash change (never a page.goto to a shell URL, which races the SSO token
+// exchange and gets bounced) is enough to trigger the Angular route — no iframe needed.
+// The route itself fires one clean JSON REST call we can just await and parse.
+const DEPOSITS_HASH_ROUTE = '#/myDeposits';
+const DEPOSITS_RESPONSE_URL_FRAGMENT = '/bff-MyDeposits/api/v1/portfolio/savings';
 
 // Same login selectors as scrapers/base-beinleumi-group.ts (the transactions scraper).
 const OTP_SEND_SMS_SELECTOR = '#sendSms';
@@ -35,11 +43,54 @@ function parseNumber(raw: string | undefined): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+// bff-MyDeposits returns dd/mm/yyyy (the classic portlets use dd.mm.yyyy elsewhere in this
+// file — accept both separators defensively).
+function parseIlDate(raw: string | null | undefined): string | undefined {
+  if (!raw) return undefined;
+  const m = raw.match(/^(\d{2})[./](\d{2})[./](\d{4})$/);
+  if (!m) return undefined;
+  return `${m[3]}-${m[2]}-${m[1]}`;
+}
+
+function normalizeDepositCurrency(raw: string | undefined): string {
+  if (!raw) return 'ILS';
+  return raw.toUpperCase() === 'NIS' ? 'ILS' : raw.toUpperCase();
+}
+
+type RawDepositLine = {
+  outPikNo?: string;
+  outKinuyByUser?: string;
+  outMisparPikadon?: string;
+  outKerenPkd?: string;
+  outShoviPkdn?: string;
+  outTrPeraon?: string;
+  outMoadimMeshihotHafkadot?: { outTrMoedHafkada?: string | null };
+  outRibit?: {
+    outRbHalufotTbl?: {
+      outRbHlfLine?: { outRbHlfTeurSugHatzmada?: string; outRbHlfAchuzRbText?: string }[];
+    };
+  };
+};
+
+type RawDepositCurrencyGroup = {
+  outShemMatbeaEng3?: string;
+  outPikListMatbea?: { outPikLine?: RawDepositLine[] };
+};
+
+type RawDepositsResponse = {
+  MyDepositsScreen?: {
+    outNoData?: unknown;
+    outMasachPikdonot?: {
+      outMasachPerMtb?: { outPikTable?: RawDepositCurrencyGroup[] };
+    };
+  };
+};
+
 export class BeinleumiPortfolioScraper extends BasePortfolioScraper {
   protected async fetchPortfolio(
     page: Page,
     credentials: Record<string, unknown>,
-  ): Promise<{ positions: PortfolioPosition[]; cash: PortfolioCash[]; asOfDate: string }> {
+  ): Promise<{ positions: PortfolioPosition[]; cash: PortfolioCash[]; deposits: PortfolioDeposit[]; asOfDate: string }> {
     const username = typeof credentials['username'] === 'string' ? credentials['username'] : '';
     const password = typeof credentials['password'] === 'string' ? credentials['password'] : '';
     const otpCodeRetriever = credentials['otpCodeRetriever'] as (() => Promise<string>) | undefined;
@@ -47,10 +98,13 @@ export class BeinleumiPortfolioScraper extends BasePortfolioScraper {
     await this.login(page, username, password, otpCodeRetriever);
     const { positions, asOfDate } = await this.extractPortfolio(page);
     const cash = await this.extractCash(page);
+    // Run last: if the deposits hash-navigation ever misbehaves, positions/cash are
+    // already safely captured before we touch it.
+    const deposits = await this.extractDeposits(page);
 
     // The FIBI checking (עו"ש) balance is emitted here as the SINGLE source of that value for
     // net worth — it must never also be counted as a standalone bank-account line elsewhere.
-    return { positions, cash, asOfDate };
+    return { positions, cash, deposits, asOfDate };
   }
 
   private async login(
@@ -230,6 +284,71 @@ export class BeinleumiPortfolioScraper extends BasePortfolioScraper {
 
       if (raw == null) return [];
       return [{ currency: 'ILS', amount: parseNumber(raw) }];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Reads term deposits/savings ("פקדונות וחסכונות") from the modern Angular shell's
+   * myDeposits route. Unlike extractPortfolio/extractCash this needs no iframe injection and
+   * no DOM scraping at all: post-login FIBI already leaves the top frame on the shell
+   * document, so a same-document hash change is enough to trigger the Angular route (verified
+   * live — it does not bounce the session the way a hard navigation to a shell URL would), and
+   * that route fires exactly one JSON REST call (bff-MyDeposits) with everything we need,
+   * including each deposit's own interest rate — no "more details" click required.
+   * Best-effort: any failure returns [] so the portfolio scrape still succeeds on its
+   * positions/cash alone.
+   */
+  private async extractDeposits(page: Page): Promise<PortfolioDeposit[]> {
+    try {
+      const onShell = await page.evaluate(() =>
+        location.pathname.includes('/appsng/Resources/PortalNG/shell'),
+      );
+      if (!onShell) return [];
+
+      const responsePromise = page
+        .waitForResponse(
+          res => res.url().includes(DEPOSITS_RESPONSE_URL_FRAGMENT) && res.request().method() === 'GET',
+          { timeout: 30_000 },
+        )
+        .catch(() => null);
+
+      await page.evaluate((hash: string) => {
+        location.hash = hash;
+      }, DEPOSITS_HASH_ROUTE);
+
+      const response = await responsePromise;
+      if (!response) return [];
+
+      const body = (await response.json()) as RawDepositsResponse;
+      const screen = body.MyDepositsScreen;
+      if (!screen || screen.outNoData != null) return [];
+
+      const groups = screen.outMasachPikdonot?.outMasachPerMtb?.outPikTable ?? [];
+      const deposits: PortfolioDeposit[] = [];
+
+      for (const group of groups) {
+        const currency = normalizeDepositCurrency(group.outShemMatbeaEng3);
+        const lines = group.outPikListMatbea?.outPikLine ?? [];
+        for (const line of lines) {
+          const rateLine = line.outRibit?.outRbHalufotTbl?.outRbHlfLine?.[0];
+          const identifier = line.outMisparPikadon || line.outPikNo || `beinleumi-deposit-${deposits.length}`;
+          deposits.push({
+            identifier,
+            name: line.outKinuyByUser || identifier,
+            currency,
+            principal: parseNumber(line.outKerenPkd),
+            currentValue: parseNumber(line.outShoviPkdn),
+            maturityDate: parseIlDate(line.outTrPeraon),
+            openDate: parseIlDate(line.outMoadimMeshihotHafkadot?.outTrMoedHafkada),
+            interestRatePercent: rateLine?.outRbHlfAchuzRbText ? parseNumber(rateLine.outRbHlfAchuzRbText) : undefined,
+            linkage: rateLine?.outRbHlfTeurSugHatzmada || undefined,
+          });
+        }
+      }
+
+      return deposits;
     } catch {
       return [];
     }
