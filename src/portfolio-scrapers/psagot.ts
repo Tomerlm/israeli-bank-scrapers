@@ -8,7 +8,9 @@ const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 const SEL = {
-  username: 'input[aria-label="Username required"]',
+  // Psagot relabelled the username field to "ID Number" (seen 2026-11); keep the old label as a
+  // fallback in case it is rolled back or differs between locales/A-B variants.
+  username: 'input[aria-label="ID Number required"], input[aria-label="Username required"]',
   password: 'input[aria-label="Password required"]',
 } as const;
 
@@ -175,9 +177,7 @@ export class PsagotScraper extends BasePortfolioScraper {
       { timeout: 30_000 },
     );
     await flutterClickByText(page, 'Login');
-    await page.waitForFunction(() => !document.querySelector('input[aria-label="Username required"]'), {
-      timeout: 60_000,
-    });
+    await page.waitForFunction((sel: string) => !document.querySelector(sel), { timeout: 60_000 }, SEL.username);
 
     // ── 4. OTP (optional) ─────────────────────────────────────────────────────
     const otpInputAppeared = await page
