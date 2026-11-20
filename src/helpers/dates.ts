@@ -15,3 +15,14 @@ export default function getAllMonthMoments(startMoment: Moment | string, futureM
 
   return allMonths;
 }
+
+/**
+ * Drops months after `endDate`'s month + `trailingMonths`. Card transactions are listed under
+ * their billing month, which is usually the month after the purchase, so a window ending on
+ * `endDate` needs one trailing month to see all of its purchases.
+ */
+export function capMonthsAt(months: Moment[], endDate: Date | undefined, trailingMonths = 1): Moment[] {
+  if (!endDate) return months;
+  const lastMonth = moment(endDate).startOf('month').add(trailingMonths, 'month');
+  return months.filter(m => m.isSameOrBefore(lastMonth));
+}

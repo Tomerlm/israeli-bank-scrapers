@@ -2,7 +2,7 @@ import moment, { type Moment } from 'moment';
 import { type Page } from 'puppeteer';
 import { ALT_SHEKEL_CURRENCY, SHEKEL_CURRENCY, SHEKEL_CURRENCY_KEYWORD } from '../constants';
 import { ScraperProgressTypes } from '../definitions';
-import getAllMonthMoments from '../helpers/dates';
+import getAllMonthMoments, { capMonthsAt } from '../helpers/dates';
 import { getDebug } from '../helpers/debug';
 import { fetchGetWithinPage, fetchPostWithinPage } from '../helpers/fetch';
 import { chunk } from '../helpers/arrays';
@@ -342,7 +342,8 @@ async function fetchAllTransactions(
   startMoment: Moment,
 ) {
   const futureMonthsToScrape = options.futureMonthsToScrape ?? 1;
-  const allMonths = getAllMonthMoments(startMoment, futureMonthsToScrape);
+  const allMonths = capMonthsAt(getAllMonthMoments(startMoment, futureMonthsToScrape), options.endDate);
+  debug(`fetching ${allMonths.length} billing months: ${allMonths.map(m => m.format('YYYY-MM')).join(', ')}`);
   const results: ScrapedAccountsWithIndex[] = await runSerial(
     allMonths.map(monthMoment => () => {
       return fetchTransactions(page, options, companyServiceOptions, startMoment, monthMoment);

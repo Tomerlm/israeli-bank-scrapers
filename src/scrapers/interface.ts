@@ -116,6 +116,14 @@ export type ScraperOptions = ScraperBrowserOptions & {
   futureMonthsToScrape?: number;
 
   /**
+   * Isracard/Amex only: don't fetch billing months after this date's month + 1. Lets callers
+   * import history in small windows (startDate → endDate) so each login makes a few API
+   * calls, instead of re-fetching every month up to today (which trips Isracard's
+   * "Block Automation" rate limit). Ignored when unset (default: up to today + futureMonthsToScrape).
+   */
+  endDate?: Date;
+
+  /**
    * if set to true, all installment transactions will be combine into the first one
    */
   combineInstallments?: boolean;
