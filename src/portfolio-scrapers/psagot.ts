@@ -131,6 +131,8 @@ export class PsagotScraper extends BasePortfolioScraper {
         void response
           .json()
           .then((body: unknown) => {
+            // Only a JSON body is a login outcome. The CORS preflight also hits /login with an
+            // empty body (and puppeteer reports it under the POST's method), so it lands in catch.
             const key = (body as { Login?: { SessionKey?: string } })?.Login?.SessionKey;
             if (key) sessionKey = key;
             const exception = (body as { Exception?: { '-ExceptionType'?: string; Message?: string } })?.Exception;
@@ -142,11 +144,9 @@ export class PsagotScraper extends BasePortfolioScraper {
             };
             // eslint-disable-next-line no-console
             console.log(`[psagot-scraper] ${describeLoginOutcome(loginOutcome)}`);
+            notifyLoginOutcome?.();
           })
-          .catch(() => {
-            loginOutcome = { status, exceptionType: 'NonJsonResponse' };
-          })
-          .finally(() => notifyLoginOutcome?.());
+          .catch(() => undefined);
         return;
       }
       if (url.includes('/V2/json/accounts')) {
@@ -163,7 +163,9 @@ export class PsagotScraper extends BasePortfolioScraper {
         if (accountMatch) {
           void response
             .json()
-            .then((body: unknown) => { capturedBalances.set(accountMatch[1], body); })
+            .then((body: unknown) => {
+              capturedBalances.set(accountMatch[1], body);
+            })
             .catch(() => undefined);
         }
       }
@@ -204,22 +206,21 @@ export class PsagotScraper extends BasePortfolioScraper {
       { timeout: 30_000 },
     );
     await flutterClickByText(page, 'Login');
-    // Proceed when either the login form goes away or the /login response arrives — a
-    // rejected login (or an OTP prompt drawn over the form) leaves the form in place.
-    const loginResponseArrived = new Promise<void>(resolve => {
-      if (loginOutcome) resolve();
-      else notifyLoginOutcome = resolve;
+    // Wait for the /login response rather than for the form to disappear: a rejected login
+    // leaves the form in place, and the form also blinks out while the request is in flight,
+    // so neither its presence nor its absence says anything about the outcome.
+    let loginWaitTimer: ReturnType<typeof setTimeout> | undefined;
+    const responded = await new Promise<boolean>(resolve => {
+      if (loginOutcome) {
+        resolve(true);
+        return;
+      }
+      notifyLoginOutcome = () => resolve(true);
+      loginWaitTimer = setTimeout(() => resolve(false), 60_000);
     });
-    const formGone = page.waitForFunction(
-      (sel: string) => !document.querySelector(sel),
-      { timeout: 60_000 },
-      SEL.username,
-    );
-    formGone.catch(() => undefined);
-    try {
-      await Promise.race([formGone, loginResponseArrived]);
-    } catch {
-      throw new Error(`Psagot login stalled: login form still showing after 60s (${describeLoginOutcome(loginOutcome)})`);
+    clearTimeout(loginWaitTimer);
+    if (!responded) {
+      throw new Error('Psagot login stalled: no response to the login request within 60s');
     }
     if (loginOutcome?.exceptionType === 'LoginException') {
       throw new PortfolioScraperError(
@@ -232,7 +233,9 @@ export class PsagotScraper extends BasePortfolioScraper {
     const otpInputAppeared = await page
       .waitForFunction(
         (known: string[]) =>
-          Array.from(document.querySelectorAll('input')).some(el => !known.includes(el.getAttribute('aria-label') ?? '')),
+          Array.from(document.querySelectorAll('input')).some(
+            el => !known.includes(el.getAttribute('aria-label') ?? ''),
+          ),
         { timeout: 15_000 },
         LOGIN_FORM_LABELS,
       )
@@ -271,7 +274,11 @@ export class PsagotScraper extends BasePortfolioScraper {
     await new Promise<void>((resolve, reject) => {
       const deadline = Date.now() + 60_000;
       const check = setInterval(() => {
-        if (sessionKey || appSessionKey) { clearInterval(check); resolve(); return; }
+        if (sessionKey || appSessionKey) {
+          clearInterval(check);
+          resolve();
+          return;
+        }
         if (Date.now() > deadline) {
           clearInterval(check);
           reject(new Error(`Login timed out: no SessionKey received (${describeLoginOutcome(loginOutcome)})`));
@@ -295,7 +302,10 @@ export class PsagotScraper extends BasePortfolioScraper {
     const effectiveKey = sessionKey || appSessionKey;
     const csession = appCsession || String(Math.random());
     // eslint-disable-next-line no-console
-    console.log('[psagot-scraper] csession captured:', appCsession ? 'yes' : 'NO (fallback random — API calls will likely fail)');
+    console.log(
+      '[psagot-scraper] csession captured:',
+      appCsession ? 'yes' : 'NO (fallback random — API calls will likely fail)',
+    );
 
     if (!effectiveKey) throw new Error('Psagot login succeeded but SessionKey was not captured from response');
 
@@ -337,8 +347,15 @@ export class PsagotScraper extends BasePortfolioScraper {
         const deadline = Date.now() + 5_000;
         const check = setInterval(() => {
           const val = capturedBalances.get(accountId);
-          if (val !== undefined) { clearInterval(check); resolve(val); return; }
-          if (Date.now() > deadline) { clearInterval(check); resolve(undefined); }
+          if (val !== undefined) {
+            clearInterval(check);
+            resolve(val);
+            return;
+          }
+          if (Date.now() > deadline) {
+            clearInterval(check);
+            resolve(undefined);
+          }
         }, 200);
       });
 

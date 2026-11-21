@@ -15,7 +15,7 @@ const MOCK_BALANCES_RESPONSE = {
         Balance: [
           {
             EquityNumber: '1159250',
-            LastRate: 23880,   // agorot → 238.80 ILS
+            LastRate: 23880, // agorot → 238.80 ILS
             OnlineNV: 10,
             AveragePrice: 22000,
             AveragePriceProfitLoss: 188,
@@ -64,18 +64,18 @@ function makeMockPage(): MockPage {
     goto: jest.fn().mockResolvedValue(null),
     waitForSelector: jest.fn().mockResolvedValue({ click: jest.fn() }),
     type: jest.fn().mockResolvedValue(null),
-    evaluate: jest.fn().mockImplementation(async (_fn: unknown, ...args: unknown[]) => {
+    evaluate: jest.fn().mockImplementation((_fn: unknown, ...args: unknown[]) => {
       const firstArg = args[0] as string | undefined;
       // apiFetch runs fetch inside the page and returns { status, text }
       if (typeof firstArg === 'string' && firstArg.includes('accounts'))
-        return { status: 200, text: JSON.stringify(MOCK_ACCOUNTS_RESPONSE) };
+        return Promise.resolve({ status: 200, text: JSON.stringify(MOCK_ACCOUNTS_RESPONSE) });
       if (typeof firstArg === 'string' && firstArg.includes('balances'))
-        return { status: 200, text: JSON.stringify(MOCK_BALANCES_RESPONSE) };
+        return Promise.resolve({ status: 200, text: JSON.stringify(MOCK_BALANCES_RESPONSE) });
       // DOM calls (no URL arg): return a mock aria-label array so OTP flow can proceed
       if (typeof _fn === 'function' && args.length === 0) {
-        return ['Mock OTP Label'];
+        return Promise.resolve(['Mock OTP Label']);
       }
-      return undefined;
+      return Promise.resolve(undefined);
     }),
     waitForFunction: jest.fn().mockResolvedValue(null),
   };
@@ -110,7 +110,7 @@ describe('PsagotScraper', () => {
     expect(result.positions[0]).toMatchObject({
       identifier: 'psagot-1159250',
       quantity: 10,
-      price: 238.8,   // 23880 agorot / 100
+      price: 238.8, // 23880 agorot / 100
     });
     expect(result.cash).toEqual([{ currency: 'ILS', amount: 500 }]);
   });
@@ -136,17 +136,22 @@ describe('PsagotScraper', () => {
     const mockPage = makeMockPage();
     mockPage.on.mockImplementation((event: string, handler: (r: unknown) => void) => {
       if (event === 'response') {
+        // CORS preflight first — empty body; must not be taken as the login outcome.
         handler({
           url: () => 'https://trade1.psagot.co.il/V2/json2/login?catalog=unified',
+          request: () => ({ method: () => 'POST' }), // puppeteer reports the preflight under the POST
+          status: () => 204,
+          json: () => Promise.reject(new Error('Unexpected end of JSON input')),
+        });
+        handler({
+          url: () => 'https://trade1.psagot.co.il/V2/json2/login?catalog=unified',
+          request: () => ({ method: () => 'POST' }),
           status: () => 401,
-          json: () => Promise.resolve({ Exception: { '-ExceptionType': 'LoginException', Message: 'Incorrect login' } }),
+          json: () =>
+            Promise.resolve({ Exception: { '-ExceptionType': 'LoginException', Message: 'Incorrect login' } }),
         });
       }
     });
-    // The rejected login leaves the form in place: the "form gone" wait never resolves.
-    mockPage.waitForFunction.mockImplementation((_fn: unknown, opts?: { timeout?: number }) =>
-      opts?.timeout === 60_000 ? new Promise(() => undefined) : Promise.resolve(null),
-    );
     const otp = jest.fn();
 
     const scraper = new PsagotScraper({});

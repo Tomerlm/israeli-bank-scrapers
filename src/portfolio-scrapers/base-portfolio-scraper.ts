@@ -1,5 +1,11 @@
 import puppeteer, { type Page } from 'puppeteer';
-import type { PortfolioCash, PortfolioDeposit, PortfolioPosition, PortfolioScraper, PortfolioScrapingResult } from './interface';
+import type {
+  PortfolioCash,
+  PortfolioDeposit,
+  PortfolioPosition,
+  PortfolioScraper,
+  PortfolioScrapingResult,
+} from './interface';
 
 export type BasePortfolioScraperOptions = {
   args?: string[];
@@ -49,5 +55,10 @@ export abstract class BasePortfolioScraper implements PortfolioScraper {
   protected abstract fetchPortfolio(
     page: Page,
     credentials: Record<string, unknown>,
-  ): Promise<{ positions: PortfolioPosition[]; cash: PortfolioCash[]; deposits?: PortfolioDeposit[]; asOfDate: string }>;
+  ): Promise<{
+    positions: PortfolioPosition[];
+    cash: PortfolioCash[];
+    deposits?: PortfolioDeposit[];
+    asOfDate: string;
+  }>;
 }
