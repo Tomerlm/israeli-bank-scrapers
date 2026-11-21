@@ -1,5 +1,5 @@
 import puppeteer, { type Page } from 'puppeteer';
-import { BasePortfolioScraper } from './base-portfolio-scraper';
+import { BasePortfolioScraper, PortfolioScraperError } from './base-portfolio-scraper';
 import type { PortfolioCash, PortfolioPosition } from './interface';
 
 jest.mock('puppeteer');
@@ -68,6 +68,16 @@ describe('BasePortfolioScraper', () => {
       expect(result.errorType).toBe('UNKNOWN');
       expect(result.errorMessage).toBe('login failed');
     }
+  });
+
+  test('passes through the errorType of a PortfolioScraperError', async () => {
+    class TypedThrowingStub extends BasePortfolioScraper {
+      protected fetchPortfolio(): Promise<FetchResult> {
+        return Promise.reject(new PortfolioScraperError('INVALID_PASSWORD', 'Incorrect login'));
+      }
+    }
+    const result = await new TypedThrowingStub({}).scrape({});
+    expect(result).toEqual({ success: false, errorType: 'INVALID_PASSWORD', errorMessage: 'Incorrect login' });
   });
 
   test('closes browser even when fetchPortfolio throws', async () => {

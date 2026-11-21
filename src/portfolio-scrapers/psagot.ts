@@ -1,5 +1,5 @@
 import { type Page } from 'puppeteer';
-import { BasePortfolioScraper } from './base-portfolio-scraper';
+import { BasePortfolioScraper, PortfolioScraperError } from './base-portfolio-scraper';
 import type { PortfolioCash, PortfolioPosition } from './interface';
 
 const BASE_URL = 'https://trade1.psagot.co.il';
@@ -13,6 +13,16 @@ const SEL = {
   username: 'input[aria-label="ID Number required"], input[aria-label="Username required"]',
   password: 'input[aria-label="Password required"]',
 } as const;
+// aria-labels of the login form's own inputs — any other input that appears is the OTP field.
+const LOGIN_FORM_LABELS = ['ID Number required', 'Username required', 'Password required'];
+
+type LoginOutcome = { status: number; sessionKey?: string; exceptionType?: string; message?: string };
+
+function describeLoginOutcome(o: LoginOutcome | undefined): string {
+  if (!o) return 'no response to the login request';
+  if (o.exceptionType) return `login response HTTP ${o.status} ${o.exceptionType}: ${o.message ?? ''}`;
+  return `login response HTTP ${o.status}${o.sessionKey ? ' with SessionKey' : ' without SessionKey'}`;
+}
 
 async function waitForElement(page: Page, selector: string, timeout = 60_000): Promise<void> {
   await page.waitForFunction((sel: string) => document.querySelector(sel) !== null, { timeout }, selector);
@@ -99,6 +109,10 @@ export class PsagotScraper extends BasePortfolioScraper {
     // Balances responses intercepted from the Flutter app's own polling — used instead of
     // explicit apiFetch for accounts the app auto-loads (avoids concurrent-request 401s).
     const capturedBalances = new Map<string, unknown>();
+    // The app shows nothing in its semantics tree when the login is rejected (the form just
+    // stays put), so read the outcome from the /login response itself.
+    let loginOutcome: LoginOutcome | undefined;
+    let notifyLoginOutcome: (() => void) | undefined;
 
     page.on('request', request => {
       const url = request.url();
@@ -113,13 +127,26 @@ export class PsagotScraper extends BasePortfolioScraper {
     page.on('response', response => {
       const url = response.url();
       if (url.includes('/login')) {
+        const status = typeof response.status === 'function' ? response.status() : 0;
         void response
           .json()
           .then((body: unknown) => {
             const key = (body as { Login?: { SessionKey?: string } })?.Login?.SessionKey;
             if (key) sessionKey = key;
+            const exception = (body as { Exception?: { '-ExceptionType'?: string; Message?: string } })?.Exception;
+            loginOutcome = {
+              status,
+              sessionKey: key,
+              exceptionType: exception ? (exception['-ExceptionType'] ?? 'Exception') : undefined,
+              message: exception?.Message,
+            };
+            // eslint-disable-next-line no-console
+            console.log(`[psagot-scraper] ${describeLoginOutcome(loginOutcome)}`);
           })
-          .catch(() => undefined);
+          .catch(() => {
+            loginOutcome = { status, exceptionType: 'NonJsonResponse' };
+          })
+          .finally(() => notifyLoginOutcome?.());
         return;
       }
       if (url.includes('/V2/json/accounts')) {
@@ -177,11 +204,38 @@ export class PsagotScraper extends BasePortfolioScraper {
       { timeout: 30_000 },
     );
     await flutterClickByText(page, 'Login');
-    await page.waitForFunction((sel: string) => !document.querySelector(sel), { timeout: 60_000 }, SEL.username);
+    // Proceed when either the login form goes away or the /login response arrives — a
+    // rejected login (or an OTP prompt drawn over the form) leaves the form in place.
+    const loginResponseArrived = new Promise<void>(resolve => {
+      if (loginOutcome) resolve();
+      else notifyLoginOutcome = resolve;
+    });
+    const formGone = page.waitForFunction(
+      (sel: string) => !document.querySelector(sel),
+      { timeout: 60_000 },
+      SEL.username,
+    );
+    formGone.catch(() => undefined);
+    try {
+      await Promise.race([formGone, loginResponseArrived]);
+    } catch {
+      throw new Error(`Psagot login stalled: login form still showing after 60s (${describeLoginOutcome(loginOutcome)})`);
+    }
+    if (loginOutcome?.exceptionType === 'LoginException') {
+      throw new PortfolioScraperError(
+        'INVALID_PASSWORD',
+        `Psagot rejected the login (${loginOutcome.message ?? 'LoginException'}) — check the ID number and password`,
+      );
+    }
 
     // ── 4. OTP (optional) ─────────────────────────────────────────────────────
     const otpInputAppeared = await page
-      .waitForFunction(() => document.querySelectorAll('input').length > 0, { timeout: 10_000 })
+      .waitForFunction(
+        (known: string[]) =>
+          Array.from(document.querySelectorAll('input')).some(el => !known.includes(el.getAttribute('aria-label') ?? '')),
+        { timeout: 15_000 },
+        LOGIN_FORM_LABELS,
+      )
       .then(() => true)
       .catch(() => false);
 
@@ -189,7 +243,7 @@ export class PsagotScraper extends BasePortfolioScraper {
       const inputs = await page.evaluate(() =>
         Array.from(document.querySelectorAll('input')).map(el => el.getAttribute('aria-label')),
       );
-      const otpAriaLabel = inputs[0] ?? '';
+      const otpAriaLabel = inputs.find(l => l && !LOGIN_FORM_LABELS.includes(l)) ?? '';
       if (otpAriaLabel) {
         // eslint-disable-next-line no-console
         console.log('[psagot-scraper] OTP required');
@@ -218,7 +272,10 @@ export class PsagotScraper extends BasePortfolioScraper {
       const deadline = Date.now() + 60_000;
       const check = setInterval(() => {
         if (sessionKey || appSessionKey) { clearInterval(check); resolve(); return; }
-        if (Date.now() > deadline) { clearInterval(check); reject(new Error('Login timed out: no SessionKey received')); }
+        if (Date.now() > deadline) {
+          clearInterval(check);
+          reject(new Error(`Login timed out: no SessionKey received (${describeLoginOutcome(loginOutcome)})`));
+        }
       }, 500);
     });
     // eslint-disable-next-line no-console

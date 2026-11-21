@@ -7,6 +7,17 @@ export type BasePortfolioScraperOptions = {
   showBrowser?: boolean;
 };
 
+/** Thrown by a portfolio scraper to report a specific errorType (e.g. INVALID_PASSWORD) instead of UNKNOWN. */
+export class PortfolioScraperError extends Error {
+  constructor(
+    public readonly errorType: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'PortfolioScraperError';
+  }
+}
+
 export abstract class BasePortfolioScraper implements PortfolioScraper {
   constructor(protected options: BasePortfolioScraperOptions) {}
 
@@ -24,7 +35,8 @@ export abstract class BasePortfolioScraper implements PortfolioScraper {
       return { success: true, ...result };
     } catch (e) {
       const errorMessage = e instanceof Error ? e.message : String(e);
-      return { success: false, errorType: 'UNKNOWN', errorMessage };
+      const errorType = e instanceof PortfolioScraperError ? e.errorType : 'UNKNOWN';
+      return { success: false, errorType, errorMessage };
     } finally {
       try {
         await browser.close();

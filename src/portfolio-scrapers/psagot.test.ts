@@ -132,6 +132,32 @@ describe('PsagotScraper', () => {
     expect(mockOtpRetriever).toHaveBeenCalledTimes(1);
   });
 
+  test('fails fast with INVALID_PASSWORD when the login response is a LoginException', async () => {
+    const mockPage = makeMockPage();
+    mockPage.on.mockImplementation((event: string, handler: (r: unknown) => void) => {
+      if (event === 'response') {
+        handler({
+          url: () => 'https://trade1.psagot.co.il/V2/json2/login?catalog=unified',
+          status: () => 401,
+          json: () => Promise.resolve({ Exception: { '-ExceptionType': 'LoginException', Message: 'Incorrect login' } }),
+        });
+      }
+    });
+    // The rejected login leaves the form in place: the "form gone" wait never resolves.
+    mockPage.waitForFunction.mockImplementation((_fn: unknown, opts?: { timeout?: number }) =>
+      opts?.timeout === 60_000 ? new Promise(() => undefined) : Promise.resolve(null),
+    );
+    const otp = jest.fn();
+
+    const scraper = new PsagotScraper({});
+    await expect(
+      (
+        scraper as unknown as { fetchPortfolio: (p: Page, c: Record<string, unknown>) => Promise<unknown> }
+      ).fetchPortfolio(mockPage as unknown as Page, { username: 'u', password: 'p', otpCodeRetriever: otp }),
+    ).rejects.toMatchObject({ errorType: 'INVALID_PASSWORD', message: expect.stringContaining('Incorrect login') });
+    expect(otp).not.toHaveBeenCalled();
+  });
+
   test('skips OTP flow when otpCodeRetriever is not provided', async () => {
     const mockPage = makeMockPage();
     const scraper = new PsagotScraper({});
